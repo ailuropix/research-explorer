@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Research Explorer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Research Explorer</h1>
+      <p class="tagline">Search authors, journals, or research topics. Summaries powered by Gemini.</p>
+      <div class="search-bar">
+        <select id="collegeSelect" aria-label="College">
+          <option value="Thakur College of Engineering and Technology">Thakur College of Engineering and Technology</option>
+          <option value="Others">Others</option>
+        </select>
+        <input id="collegeOtherInput" type="text" placeholder="Enter college name" style="display:none" />
+        <select id="deptSelect" aria-label="Department">
+          <option value="Artificial Intelligence and Data Science">Artificial Intelligence and Data Science</option>
+          <option value="Others">Others</option>
+        </select>
+        <input id="deptOtherInput" type="text" placeholder="Enter department" style="display:none" />
+        <input id="facultyInput" type="text" placeholder="Faculty name (e.g., John Doe)" />
+        <button id="findBtn">Find Publications</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="resultsSection" class="panel">
+        <h2>Results</h2>
+        <div id="kpiBar" class="kpi-bar" aria-live="polite">
+          <div class="kpi-card kpi-blue">
+            <div class="kpi-label">Total Publications</div>
+            <div id="kpiTotalPubs" class="kpi-value">—</div>
+          </div>
+          <div class="kpi-card kpi-cyan">
+            <div class="kpi-label">Last Updated</div>
+            <div id="kpiUpdated" class="kpi-value">—</div>
+          </div>
+        </div>
+        <div id="controls" class="controls">
+          <div class="control-group">
+            <label for="yearFrom">Year from</label>
+            <input id="yearFrom" type="number" placeholder="e.g., 2015" />
+          </div>
+          <div class="control-group">
+            <label for="yearTo">Year to</label>
+            <input id="yearTo" type="number" placeholder="e.g., 2024" />
+          </div>
+          <div class="control-group">
+            <label for="venueInput">Venue</label>
+            <input id="venueInput" type="text" placeholder="Venue contains…" />
+          </div>
+          <div class="control-group">
+            <label for="typeSelect">Type</label>
+            <select id="typeSelect">
+              <option value="any">Any</option>
+              <option value="journal">Journal</option>
+              <option value="conference">Conference</option>
+              <option value="preprint">Preprint</option>
+              <option value="book">Book</option>
+              <option value="thesis">Thesis</option>
+              <option value="dataset">Dataset</option>
+              <option value="patent">Patent</option>
+              <option value="other">Other</option>
+              <option value="web">Web</option>
+            </select>
+          </div>
+          <div class="control-group">
+            <label for="sortSelect">Sort</label>
+            <select id="sortSelect">
+              <option value="relevance">Relevance</option>
+              <option value="yearDesc">Year ↓</option>
+              <option value="yearAsc">Year ↑</option>
+            </select>
+          </div>
+          <div class="control-group" style="align-self:end;">
+            <label>
+              <input id="includeWeb" type="checkbox" /> Include web results
+            </label>
+          </div>
+          <div class="control-group">
+            <button id="applyFilters" class="view-btn">Apply</button>
+          </div>
+        </div>
+        <div id="resultsMeta" class="source" style="margin: 6px 0 4px;"></div>
+        <div id="resultsList" class="cards"></div>
+      </section>
+
+      <section id="summarySection" class="panel">
+        <div class="summary-header">
+          <h2>AI Summary</h2>
+          <button id="toggleSummary" class="link-btn" aria-expanded="true">Hide</button>
+        </div>
+        <div id="summaryContent" class="summary-content"></div>
+      </section>
+    </main>
+
+    <footer>
+      <span>Built with Serper + Gemini</span>
+    </footer>
+  </div>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

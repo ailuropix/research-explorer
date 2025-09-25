@@ -157,41 +157,34 @@ app.post('/api/query', async (req, res) => {
     if (!query) return res.status(400).json({ error: 'Missing query' });
 
     let items = [];
-    if (SERPER_API_KEY) {
+    if (process.env.SERPER_API_KEY) {
       try {
-        const r = await fetchWithTimeout('https://google.serper.dev/search', {
+        const r = await fetch('https://google.serper.dev/search', {
           method: 'POST',
-          headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ q: query, gl: 'in', num: 12 })
-        }, 7000);
+          headers: { 'X-API-KEY': process.env.SERPER_API_KEY, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ q: query, gl: 'in', num: 8 })
+        });
         if (r.ok) {
-          items = normalizeSerperResults(await r.json()).slice(0, 12);
+          const j = await r.json();
+          const seen = new Set();
+          items = [...(j.organic || [])].map(it => ({
+            title: it.title || '',
+            snippet: it.snippet || '',
+            link: it.link || it.url || '',
+            source: (() => { try { return new URL(it.link || it.url || '').hostname; } catch { return 'web'; } })()
+          })).filter(x => x.title && x.link && !seen.has(x.link) && seen.add(x.link));
         }
-      } catch (e) {
-        console.warn('[QUERY] serper timeout/err:', e?.name || e?.message || e);
-      }
+      } catch { /* ignore */ }
     }
 
-    let summary = '';
-    if (GOOGLE_API_KEY && items.length) {
-      try {
-        const { GoogleGenerativeAI } = await import('@google/generative-ai');
-        const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY);
-        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-        const prompt = buildSummaryPrompt(classifyQuery(query), query, items);
-        const summaryPromise = model.generateContent(prompt).then(r => r?.response?.text?.() || '');
-        summary = await Promise.race([summaryPromise, new Promise(r => setTimeout(() => r(''), 2500))]);
-      } catch (e) {
-        console.warn('[QUERY] gemini err:', e?.message || e);
-      }
-    }
-
-    res.json({ ok: true, items, summary });
+    // Skip Gemini to guarantee we never hit the cap
+    res.json({ ok: true, items, summary: '' });
   } catch (err) {
     console.error('QUERY_ERROR', err);
-    res.status(200).json({ ok: true, items: [], summary: '' });
+    res.json({ ok: true, items: [], summary: '' });
   }
 });
+
 
 /* =======================================================================================
    D) Author publications (SCRAPE + ALWAYS SAVE) — POST /api/authorPublications
@@ -201,21 +194,19 @@ app.post('/api/query', async (req, res) => {
    - Response shape: { ok, author, publications, metrics, next? }
 ======================================================================================= */
 app.post('/api/authorPublications', async (req, res) => {
-  const started = Date.now();
-  const BUDGET_MS = 9000; // leave cushion for Vercel 10s cap
-
+  const t0 = Date.now();
   try {
-    const { name, affiliation = '', department = '', full = 0, next } = req.body || {};
+    const { name, affiliation = '', department = '' } = req.body || {};
     if (!name) return res.status(400).json({ error: 'Missing name' });
 
-    // --- 1) Pick best author on SS (one quick call) ---
+    // 1) Find best author on SS (quick)
     let best = null;
     try {
       const url = `https://api.semanticscholar.org/graph/v1/author/search?query=${encodeURIComponent(name)}&limit=10`;
-      const sresp = await fetchWithTimeout(url, {}, Math.min(5000, timeLeft(started, BUDGET_MS)));
-      if (sresp.ok) {
-        const sjson = await sresp.json();
-        const cands = Array.isArray(sjson?.data) ? sjson.data : [];
+      const s = await fetch(url);
+      if (s.ok) {
+        const js = await s.json();
+        const cands = Array.isArray(js?.data) ? js.data : [];
         const affL = affiliation.toLowerCase(), depL = department.toLowerCase();
         best = cands
           .map(c => {
@@ -228,37 +219,22 @@ app.post('/api/authorPublications', async (req, res) => {
           })
           .sort((a,b) => b.score - a.score)[0]?.c || cands[0] || null;
       }
-    } catch (e) {
-      console.warn('[APUB] SS author search err:', e?.name || e?.message || e);
-    }
+    } catch {}
 
-    // No author → empty but still try Crossref/OpenAlex single page (best-effort)
-    const ssAuthorId = best?.authorId || null;
-
-    // --- 2) Gather publications ---
-    const publications = [];
-    let ssOffset = (next && typeof next.ssOffset === 'number') ? next.ssOffset : 0;
-    const SS_PAGE = 100;
-
-    // 2A) Semantic Scholar — page in a loop while time allows or until not full
-    if (ssAuthorId) {
+    const pubs = [];
+    // 2) First page of SS papers (limit=100) – fast and within cap
+    if (best?.authorId) {
       const fields = 'title,year,venue,url,authors,externalIds,publicationTypes,abstract';
-      const wantAll = String(full) === '1' || full === 1 || full === true;
-
-      // loop while time left and either full requested or it's the first page
-      while (timeLeft(started, BUDGET_MS) > 1500) {
-        const pURL = `https://api.semanticscholar.org/graph/v1/author/${ssAuthorId}/papers?limit=${SS_PAGE}&offset=${ssOffset}&fields=${encodeURIComponent(fields)}`;
-        let pageOK = false;
-        try {
-          const pResp = await fetchWithTimeout(pURL, {}, Math.min(4000, timeLeft(started, BUDGET_MS)));
-          if (!pResp.ok) break;
-          const pJson = await pResp.json();
-          const data = Array.isArray(pJson?.data) ? pJson.data : [];
-          pageOK = true;
-
-          const mapped = data
-            .filter(p => (Array.isArray(p.authors) ? p.authors : []).some(a => a?.name && namesSimilar(a.name, name)))
-            .map(p => ({
+      const url = `https://api.semanticscholar.org/graph/v1/author/${best.authorId}/papers?limit=100&offset=0&fields=${encodeURIComponent(fields)}`;
+      try {
+        const r = await fetch(url);
+        if (r.ok) {
+          const j = await r.json();
+          const data = Array.isArray(j?.data) ? j.data : [];
+          for (const p of data) {
+            const hasName = (Array.isArray(p.authors) ? p.authors : []).some(a => a?.name && a.name.toLowerCase().includes(name.toLowerCase()));
+            if (!hasName) continue;
+            pubs.push({
               title: p.title || '',
               year: p.year || null,
               venue: p.venue || '',
@@ -268,189 +244,55 @@ app.post('/api/authorPublications', async (req, res) => {
               type: (Array.isArray(p.publicationTypes) && p.publicationTypes[0]) ? p.publicationTypes[0].toLowerCase() : 'other',
               origin: 'SS',
               abstract: p.abstract || ''
-            }))
-            .filter(p => p.title);
-
-          publications.push(...mapped);
-
-          // if fewer than page size, we're done
-          if (data.length < SS_PAGE) { ssOffset += data.length; break; }
-
-          ssOffset += SS_PAGE;
-          if (!wantAll) break; // first page only when not full
-        } catch (e) {
-          console.warn('[APUB] SS page err:', e?.name || e?.message || e);
-          break;
-        }
-        if (!pageOK) break;
-      }
-    }
-
-    // 2B) Crossref — one page for enrichment (best effort)
-    let crItems = [];
-    try {
-      const cr = new URL('https://api.crossref.org/works');
-      cr.searchParams.set('query.author', name);
-      const affStr = [affiliation, department].filter(Boolean).join(' ');
-      if (affStr) cr.searchParams.set('query.affiliation', affStr);
-      cr.searchParams.set('rows', '100');
-      const crResp = await fetchWithTimeout(cr.toString(), { headers: { 'User-Agent': 'ResearchExplorer/1.0 (mailto:contact@example.com)' } }, Math.min(4000, timeLeft(started, BUDGET_MS)));
-      if (crResp.ok) {
-        const j = await crResp.json();
-        const items = j?.message?.items || [];
-        crItems = items
-          .filter(x => {
-            const authors = Array.isArray(x.author) ? x.author : [];
-            const nameOk = authors.some(a => namesSimilar(`${a.given || ''} ${a.family || ''}`.trim(), name));
-            if (!nameOk) return false;
-            if (!affiliation && !department) return true;
-            return authors.some(a =>
-              (Array.isArray(a.affiliation) ? a.affiliation : [])
-                .some(af => includesAff((af?.name || ''), affiliation, department))
-            );
-          })
-          .map(x => ({
-            title: Array.isArray(x.title) ? x.title[0] : (x.title || ''),
-            year: (x.issued && Array.isArray(x.issued['date-parts']) && x.issued['date-parts'][0]?.[0]) || null,
-            venue: x['container-title'] ? (Array.isArray(x['container-title']) ? x['container-title'][0] : x['container-title']) : '',
-            url: x.URL || (x.DOI ? `https://doi.org/${x.DOI}` : ''),
-            doi: x.DOI || '',
-            authors: (Array.isArray(x.author) ? x.author.map(a => `${a.given || ''} ${a.family || ''}`.trim()).filter(Boolean) : []),
-            type: (x.type || 'other').toLowerCase(),
-            origin: 'CR',
-            abstract: ''
-          }))
-          .filter(p => p.title);
-      }
-    } catch (e) {
-      console.warn('[APUB] CR err:', e?.name || e?.message || e);
-    }
-
-    // 2C) OpenAlex — one page for enrichment (best effort)
-    let oaItems = [];
-    try {
-      const aURL = new URL('https://api.openalex.org/authors');
-      aURL.searchParams.set('search', name);
-      aURL.searchParams.set('per-page', '10');
-      const aResp = await fetchWithTimeout(aURL.toString(), {}, Math.min(3000, timeLeft(started, BUDGET_MS)));
-      if (aResp.ok) {
-        const aj = await aResp.json();
-        const cands = Array.isArray(aj?.results) ? aj.results : [];
-        if (cands.length) {
-          const affL = affiliation.toLowerCase(), depL = department.toLowerCase();
-          let bestOA = null, bestScore = -1;
-          for (const c of cands) {
-            const nm = (c.display_name || '').toLowerCase();
-            const inst = (c.last_known_institution?.display_name || '').toLowerCase();
-            let s = 0;
-            if (nm === name.toLowerCase()) s += 3;
-            if (affL && inst.includes(affL)) s += 2;
-            if (depL && inst.includes(depL)) s += 1;
-            if (s > bestScore) { bestScore = s; bestOA = c; }
-          }
-          const target = bestOA || cands[0];
-          const orcid = target?.orcid?.replace('https://orcid.org/', '') || '';
-          const wURL = new URL('https://api.openalex.org/works');
-          wURL.searchParams.set('per-page', '100');
-          if (orcid) wURL.searchParams.set('filter', `author.orcid:${orcid}`);
-          else wURL.searchParams.set('filter', `author.display_name:${name}`);
-          const wResp = await fetchWithTimeout(wURL.toString(), {}, Math.min(3500, timeLeft(started, BUDGET_MS)));
-          if (wResp.ok) {
-            const wj = await wResp.json();
-            const works = Array.isArray(wj?.results) ? wj.results : [];
-            oaItems = works.map(w => ({
-              title: w.title || '',
-              year: w.publication_year || null,
-              venue: w.host_venue?.display_name || '',
-              url: w.primary_location?.landing_page_url || (w.doi ? `https://doi.org/${w.doi}` : ''),
-              doi: w.doi || '',
-              authors: (w.authorships || []).map(a => a.author?.display_name).filter(Boolean),
-              type: (w.type || 'other').toLowerCase(),
-              origin: 'OA',
-              abstract: ''
-            }))
-            .filter(p => p.title);
+            });
           }
         }
-      }
-    } catch (e) {
-      console.warn('[APUB] OA err:', e?.name || e?.message || e);
+      } catch {}
     }
 
-    // --- 3) Merge & dedupe (doi -> url -> title+year) ---
+    // 3) Dedupe (doi -> url -> title+year)
     const byKey = new Map();
-    const push = (p) => {
+    for (const p of pubs) {
       const k = (p.doi && `doi:${p.doi.toLowerCase()}`) ||
                 (p.url && `url:${p.url.toLowerCase()}`) ||
                 `ty:${(p.title || '').toLowerCase()}::${p.year || ''}`;
       if (!byKey.has(k)) byKey.set(k, p);
-    };
-    [...publications, ...crItems, ...oaItems].forEach(push);
-    const merged = Array.from(byKey.values());
+    }
+    const publications = Array.from(byKey.values());
 
-    // --- 4) Metrics (best effort, quick) ---
-    let metrics = {
-      totalPublications: merged.length,
+    // 4) Quick metrics
+    const metrics = {
+      totalPublications: publications.length,
       totalCitations: null,
       hIndex: null,
       lastUpdated: new Date().toISOString().slice(0,10)
     };
-    try {
-      if (ssAuthorId) {
-        const det = await fetchWithTimeout(
-          `https://api.semanticscholar.org/graph/v1/author/${ssAuthorId}?fields=hIndex,citationCount,paperCount,updated`,
-          {},
-          Math.min(2500, timeLeft(started, BUDGET_MS))
-        );
-        if (det.ok) {
-          const dj = await det.json();
-          metrics.totalCitations = Number.isFinite(dj.citationCount) ? dj.citationCount : metrics.totalCitations;
-          metrics.hIndex = Number.isFinite(dj.hIndex) ? dj.hIndex : metrics.hIndex;
-          metrics.lastUpdated = dj.updated || metrics.lastUpdated;
-        }
-      }
-    } catch {}
 
-    // --- 5) ALWAYS save to DB (idempotent upserts in persist.js) ---
+    // 5) ALWAYS save to DB (your persist.js already handles upserts)
     try {
       const { saveFacultyAndPublications } = await import('./src/services/persist.js');
       await saveFacultyAndPublications({
         name,
         college: affiliation || 'Unknown',
         department: department || 'Unknown',
-        externalIds: ssAuthorId ? { semanticScholar: ssAuthorId } : {},
-        publications: merged,
+        externalIds: best?.authorId ? { semanticScholar: best.authorId } : {},
+        publications,
         metrics
       });
     } catch (e) {
-      console.error('[DB SAVE] failed:', e?.message || e);
-      // continue response anyway
-    }
-
-    // --- 6) Continuation token if time ran out and user asked for full ---
-    let nextToken = null;
-    if (ssAuthorId && (String(full) === '1' || full === 1 || full === true)) {
-      // If there is likely more SS data and we ran out of time, expose next state
-      if (timeLeft(started, BUDGET_MS) < 1200) {
-        nextToken = { ssOffset };
-      } else {
-        // If last page was exactly full page, we probably have more
-        if (merged.length && merged.length % 100 === 0) {
-          nextToken = { ssOffset };
-        }
-      }
+      console.warn('[DB SAVE] failed (continuing):', e?.message || e);
     }
 
     res.json({
       ok: true,
-      author: best ? { id: ssAuthorId, name: best.name || name } : null,
-      publications: merged,
+      author: best ? { id: best.authorId, name: best.name || name } : null,
+      publications,
       metrics,
-      next: nextToken
+      elapsedMs: Date.now() - t0
     });
   } catch (err) {
     console.error('AUTHOR_PUBLICATIONS_ERROR', err);
-    res.status(200).json({ ok: true, author: null, publications: [], metrics: null, next: null });
+    res.json({ ok: true, author: null, publications: [], metrics: null, elapsedMs: Date.now() - t0 });
   }
 });
 

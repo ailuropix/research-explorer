@@ -7,13 +7,22 @@
   "type": "module",
   "scripts": {
     "dev": "node server.js",
-    "start": "NODE_ENV=production node server.js"
+    "start": "NODE_ENV=production node server.js",
+    "db:up": "docker compose -f docker-compose.db.yml up -d",
+    "db:down": "docker compose -f docker-compose.db.yml down",
+    "db:migrate": "prisma migrate dev",
+    "db:generate": "prisma generate",
+    "db:studio": "prisma studio",
+    "db:reset": "prisma migrate reset"
   },
   "dependencies": {
     "@google/generative-ai": "^0.17.1",
+    "@prisma/client": "^6.16.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "node-fetch": "^3.3.2"
+    "express": "^4.21.2",
+    "node-fetch": "^3.3.2",
+    "prisma": "^6.16.2",
+    "serverless-http": "^4.0.0"
   }
 }

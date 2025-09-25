@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { saveFacultyAndPublications, getAllFaculty, getFacultyPublications, getDepartmentSummary } from './src/services/persist.js';
 
 dotenv.config();
 
@@ -26,6 +27,15 @@ app.get('/api/health', (req, res) => {
 // --- Helpers ---
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+
+// Function to check if an affiliation string includes any of the search terms
+function includesAff(affiliation = '', ...searchTerms) {
+  if (!affiliation) return false;
+  const affLower = String(affiliation).toLowerCase();
+  return searchTerms
+    .filter(term => term) // Remove empty/undefined terms
+    .some(term => affLower.includes(term.toLowerCase()));
+}
 
 // Function to check if two names are similar
 function namesSimilar(a = '', b = '') {
@@ -457,7 +467,18 @@ app.post('/api/authorPublications', async (req, res) => {
             const nameOk = authors.some(a => namesSimilar(`${a.given || ''} ${a.family || ''}`.trim(), name));
             if (!nameOk) return false;
             if (affiliation || department) {
-              return authors.some(a => (a.affiliation || []).some(f => includesAff(f.name || '', affiliation, department)));
+              try {
+                return authors.some(a => {
+                  const affiliations = Array.isArray(a.affiliation) ? a.affiliation : [];
+                  return affiliations.some(aff => {
+                    const affName = (aff && typeof aff === 'object' ? aff.name : aff) || '';
+                    return includesAff(affName, affiliation, department);
+                  });
+                });
+              } catch (err) {
+                console.error('Error checking affiliations:', err);
+                return true; // Include the paper if there's an error checking affiliations
+              }
             }
             return true;
           })
@@ -601,10 +622,94 @@ app.post('/api/authorPublications', async (req, res) => {
 
     const authorOut = best ? { id: best.authorId, name: best.name } : null;
     console.log('[AUTHOR_PUBS] Author:', authorOut?.name || 'unknown', 'SS:', publicationsSS.length, 'CR:', publicationsCR.length, 'OA:', publicationsOA.length, 'Deduped:', deduped.length);
-    res.json({ author: authorOut, publications: deduped, metrics });
+
+    // Prepare external IDs for database storage
+    const externalIds = {};
+    if (best?.authorId) externalIds.semanticScholar = best.authorId;
+    if (best?.externalIds?.ORCID) externalIds.orcid = best.externalIds.ORCID;
+
+    // Save to database
+    let savedData = null;
+    try {
+      console.log('[DB] Saving faculty and publications to database...');
+      savedData = await saveFacultyAndPublications({
+        name: name,
+        college: affiliation || 'Unknown',
+        department: department || 'Unknown',
+        externalIds: externalIds,
+        publications: deduped.map(p => ({
+          title: p.title,
+          year: p.year,
+          venue: p.venue,
+          doi: p.doi,
+          url: p.url,
+          abstract: p.abstract || '',
+          externalIds: { [p.origin]: true }
+        })),
+        metrics: metrics
+      });
+      console.log(`[DB] Successfully saved faculty ${savedData.faculty.fullName} with ${savedData.publications.length} publications`);
+    } catch (dbError) {
+      console.error('[DB] Error saving to database:', dbError);
+      // Continue with response even if DB save fails
+    }
+
+    res.json({
+      author: authorOut,
+      publications: deduped,
+      metrics,
+      facultyId: savedData?.faculty?.id || null
+    });
   } catch (err) {
     console.error('AUTHOR_PUBLICATIONS_ERROR', err);
     res.status(500).json({ error: 'Unexpected error', detail: String(err) });
+  }
+});
+
+// Admin API: Get faculty list with optional department filter
+app.get('/api/faculty', async (req, res) => {
+  try {
+    const { department } = req.query;
+    const faculty = await getAllFaculty(department);
+    res.json({ faculty });
+  } catch (err) {
+    console.error('FACULTY_LIST_ERROR', err);
+    res.status(500).json({ error: 'Failed to fetch faculty list', detail: String(err) });
+  }
+});
+
+// Admin API: Get publications for a specific faculty
+app.get('/api/faculty/:id/publications', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { yearFrom, yearTo } = req.query;
+
+    const publications = await getFacultyPublications(
+      id,
+      yearFrom ? parseInt(yearFrom) : null,
+      yearTo ? parseInt(yearTo) : null
+    );
+
+    res.json({ publications });
+  } catch (err) {
+    console.error('FACULTY_PUBLICATIONS_ERROR', err);
+    res.status(500).json({ error: 'Failed to fetch faculty publications', detail: String(err) });
+  }
+});
+
+// Admin API: Get department summary
+app.get('/api/admin/summary', async (req, res) => {
+  try {
+    const { department } = req.query;
+    if (!department) {
+      return res.status(400).json({ error: 'Department parameter is required' });
+    }
+
+    const summary = await getDepartmentSummary(department);
+    res.json({ summary });
+  } catch (err) {
+    console.error('DEPARTMENT_SUMMARY_ERROR', err);
+    res.status(500).json({ error: 'Failed to fetch department summary', detail: String(err) });
   }
 });
 
@@ -613,6 +718,13 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`Research Explorer server running on http://localhost:${PORT}`);
-});
+// Only start the server when NOT running on Vercel (serverless)
+if (process.env.VERCEL !== '1') {
+  app.listen(PORT, () => {
+    console.log(`Research Explorer server running on http://localhost:${PORT}`);
+  });
+}
+
+// Export the Express app so Vercel can wrap it as a serverless function
+export default app;
+

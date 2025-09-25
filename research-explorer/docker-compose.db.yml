@@ -1,0 +1,24 @@
+# Update docker-compose.db.yml
+services:
+  postgres:
+    image: postgres:16
+    container_name: fra_postgres
+    environment:
+      POSTGRES_USER: fra_admin
+      POSTGRES_PASSWORD: fra_pass
+      POSTGRES_DB: fra_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    # Add this for better network access:
+    networks:
+      - research-network
+
+networks:
+  research-network:
+    driver: bridge
+
+volumes:
+  postgres_data:

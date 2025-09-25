@@ -1,0 +1,74 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL") // runtime (pooled)
+  directUrl = env("DIRECT_URL") // migrations (direct)
+}
+
+model Faculty {
+  id          String   @id @default(cuid())
+  fullName    String
+  college     String
+  department  String
+  externalIds Json?    @default("{}") // Store Semantic Scholar, OpenAlex IDs etc.
+
+  // Unique constraint on fullName + college + department
+  @@unique([fullName, college, department])
+
+  // Relations
+  publications    Publication[]
+  metrics         FacultyMetrics?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Publication {
+  id          String   @id @default(cuid())
+  title       String
+  year        Int?
+  venue       String?
+  doi         String?  @unique
+  url         String?
+  abstract    String?
+
+  // Foreign key to Faculty
+  facultyId   String
+
+  // Deduplication fields
+  externalIds Json?    @default("{}") // Store external IDs (SS, OA, CR)
+
+  // Relations
+  faculty     Faculty  @relation(fields: [facultyId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Composite unique constraint for deduplication
+  @@unique([facultyId, doi])
+  @@index([facultyId, year])
+  @@index([facultyId])
+}
+
+model FacultyMetrics {
+  id              String   @id @default(cuid())
+
+  // Foreign key to Faculty
+  facultyId       String   @unique
+  faculty         Faculty  @relation(fields: [facultyId], references: [id], onDelete: Cascade)
+
+  // Metrics
+  hIndex          Int      @default(0)
+  totalPublications Int   @default(0)
+  totalCitations  Int      @default(0)
+  lastUpdated     DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

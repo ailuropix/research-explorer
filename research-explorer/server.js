@@ -718,13 +718,14 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Only start the server when NOT running on Vercel (serverless)
-if (process.env.VERCEL !== '1') {
+/// ✅ export app for serverless
+export default app;
+
+// ✅ only run a local server if you start it with `node server.js`
+if (process.env.VERCEL !== "1" && process.env.NODE_ENV !== "production") {
+  const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
-    console.log(`Research Explorer server running on http://localhost:${PORT}`);
+    console.log(`Server running locally at http://localhost:${PORT}`);
   });
 }
-
-// Export the Express app so Vercel can wrap it as a serverless function
-export default app;
 

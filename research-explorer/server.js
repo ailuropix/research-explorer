@@ -17,9 +17,9 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true, ts: Date.now(), env: process.env.NODE_ENV || 'dev' });
 });
 
-/* ---------------------------------------------------------------------------------------
-   Helpers (pure, no I/O here)
---------------------------------------------------------------------------------------- */
+/* =======================================================================================
+   Helpers (pure, no top-level I/O)
+======================================================================================= */
 const SERPER_API_KEY = process.env.SERPER_API_KEY || '';
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || '';
 
@@ -93,32 +93,42 @@ function normalizeSerperResults(json) {
   return items.filter(it => !seen.has(it.link) && seen.add(it.link));
 }
 
-/* ---------------------------------------------------------------------------------------
+function fetchWithTimeout(url, opts = {}, ms = 7000) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(id));
+}
+
+function timeLeft(start, budgetMs) {
+  return Math.max(0, budgetMs - (Date.now() - start));
+}
+
+/* =======================================================================================
    A) Web search (Serper) — POST /api/search
---------------------------------------------------------------------------------------- */
+======================================================================================= */
 app.post('/api/search', async (req, res) => {
   try {
     const { query } = req.body || {};
     if (!query) return res.status(400).json({ error: 'Missing query' });
     if (!SERPER_API_KEY) return res.json({ query, items: [] });
 
-    const r = await fetch('https://google.serper.dev/search', {
+    const r = await fetchWithTimeout('https://google.serper.dev/search', {
       method: 'POST',
       headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify({ q: query, gl: 'in', num: 20 })
-    });
+    }, 7000);
     const j = r.ok ? await r.json() : {};
     const items = normalizeSerperResults(j);
     res.json({ query, items });
   } catch (err) {
     console.error('SEARCH_ERROR', err);
-    res.status(500).json({ error: 'Unexpected error' });
+    res.status(200).json({ query: req.body?.query || '', items: [] });
   }
 });
 
-/* ---------------------------------------------------------------------------------------
+/* =======================================================================================
    B) Summarize (Gemini) — POST /api/summarize
---------------------------------------------------------------------------------------- */
+======================================================================================= */
 app.post('/api/summarize', async (req, res) => {
   try {
     const { query, items } = req.body || {};
@@ -134,123 +144,161 @@ app.post('/api/summarize', async (req, res) => {
     res.json({ query, kind: classifyQuery(query), summary: text });
   } catch (err) {
     console.error('SUMMARIZE_ERROR', err);
-    res.status(500).json({ error: 'Unexpected error' });
+    res.status(200).json({ query: req.body?.query || '', kind: classifyQuery(req.body?.query || ''), summary: '' });
   }
 });
 
-/* ---------------------------------------------------------------------------------------
+/* =======================================================================================
    C) Compose search + (optional) summary — POST /api/query
---------------------------------------------------------------------------------------- */
+======================================================================================= */
 app.post('/api/query', async (req, res) => {
   try {
     const { query } = req.body || {};
     if (!query) return res.status(400).json({ error: 'Missing query' });
 
-    const items = await (async () => {
-      if (!SERPER_API_KEY) return [];
-      const r = await fetch('https://google.serper.dev/search', {
-        method: 'POST',
-        headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ q: query, gl: 'in', num: 20 })
-      });
-      const j = r.ok ? await r.json() : {};
-      return normalizeSerperResults(j);
-    })();
+    let items = [];
+    if (SERPER_API_KEY) {
+      try {
+        const r = await fetchWithTimeout('https://google.serper.dev/search', {
+          method: 'POST',
+          headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ q: query, gl: 'in', num: 12 })
+        }, 7000);
+        if (r.ok) {
+          items = normalizeSerperResults(await r.json()).slice(0, 12);
+        }
+      } catch (e) {
+        console.warn('[QUERY] serper timeout/err:', e?.name || e?.message || e);
+      }
+    }
 
-    const summary = await (async () => {
-      if (!GOOGLE_API_KEY || items.length === 0) return '';
+    let summary = '';
+    if (GOOGLE_API_KEY && items.length) {
       try {
         const { GoogleGenerativeAI } = await import('@google/generative-ai');
         const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY);
         const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
         const prompt = buildSummaryPrompt(classifyQuery(query), query, items);
-        const result = await model.generateContent(prompt);
-        return result?.response?.text?.() || '';
+        const summaryPromise = model.generateContent(prompt).then(r => r?.response?.text?.() || '');
+        summary = await Promise.race([summaryPromise, new Promise(r => setTimeout(() => r(''), 2500))]);
       } catch (e) {
-        console.warn('Gemini summarization failed:', e?.message || e);
-        return '';
+        console.warn('[QUERY] gemini err:', e?.message || e);
       }
-    })();
+    }
 
     res.json({ ok: true, items, summary });
   } catch (err) {
     console.error('QUERY_ERROR', err);
-    res.status(500).json({ error: 'Unexpected error' });
+    res.status(200).json({ ok: true, items: [], summary: '' });
   }
 });
 
-/* ---------------------------------------------------------------------------------------
+/* =======================================================================================
    D) Author publications (SCRAPE + ALWAYS SAVE) — POST /api/authorPublications
---------------------------------------------------------------------------------------- */
+   - Returns ALL publications from Semantic Scholar by paging.
+   - To fetch every page within Vercel 10s: use `full=1` and the API may return `next` token.
+     Keep calling with that token until `next` is null.
+   - Response shape: { ok, author, publications, metrics, next? }
+======================================================================================= */
 app.post('/api/authorPublications', async (req, res) => {
+  const started = Date.now();
+  const BUDGET_MS = 9000; // leave cushion for Vercel 10s cap
+
   try {
-    const { name, affiliation = '', department = '' } = req.body || {};
+    const { name, affiliation = '', department = '', full = 0, next } = req.body || {};
     if (!name) return res.status(400).json({ error: 'Missing name' });
 
-    // -- Semantic Scholar: author candidates
+    // --- 1) Pick best author on SS (one quick call) ---
     let best = null;
     try {
-      const sresp = await fetch(`https://api.semanticscholar.org/graph/v1/author/search?query=${encodeURIComponent(name)}&limit=10`);
+      const url = `https://api.semanticscholar.org/graph/v1/author/search?query=${encodeURIComponent(name)}&limit=10`;
+      const sresp = await fetchWithTimeout(url, {}, Math.min(5000, timeLeft(started, BUDGET_MS)));
       if (sresp.ok) {
         const sjson = await sresp.json();
-        const candidates = Array.isArray(sjson?.data) ? sjson.data : [];
+        const cands = Array.isArray(sjson?.data) ? sjson.data : [];
         const affL = affiliation.toLowerCase(), depL = department.toLowerCase();
-        best = candidates
+        best = cands
           .map(c => {
             const fields = [c.name || '', ...(c.aliases || []), ...(c.affiliations || [])].join(' ').toLowerCase();
             let score = 0;
             if ((c.name || '').toLowerCase() === name.toLowerCase()) score += 2;
-            if (affL && fields.includes(affL)) score += 3;
+            if (affL && fields.includes(affL)) score += 2;
             if (depL && fields.includes(depL)) score += 1;
             return { c, score };
           })
-          .sort((a, b) => b.score - a.score)[0]?.c || candidates[0] || null;
+          .sort((a,b) => b.score - a.score)[0]?.c || cands[0] || null;
       }
-    } catch (e) { console.warn('[SS] author search failed', e); }
+    } catch (e) {
+      console.warn('[APUB] SS author search err:', e?.name || e?.message || e);
+    }
 
-    // -- SS publications (paged)
-    const pubsSS = [];
-    if (best?.authorId) {
+    // No author → empty but still try Crossref/OpenAlex single page (best-effort)
+    const ssAuthorId = best?.authorId || null;
+
+    // --- 2) Gather publications ---
+    const publications = [];
+    let ssOffset = (next && typeof next.ssOffset === 'number') ? next.ssOffset : 0;
+    const SS_PAGE = 100;
+
+    // 2A) Semantic Scholar — page in a loop while time allows or until not full
+    if (ssAuthorId) {
       const fields = 'title,year,venue,url,authors,externalIds,publicationTypes,abstract';
-      const pageSize = 100;
-      for (let offset = 0; offset < 500; offset += pageSize) {
-        const url = `https://api.semanticscholar.org/graph/v1/author/${best.authorId}/papers?limit=${pageSize}&offset=${offset}&fields=${encodeURIComponent(fields)}`;
-        const presp = await fetch(url);
-        if (!presp.ok) break;
-        const pjson = await presp.json();
-        const items = Array.isArray(pjson?.data) ? pjson.data : [];
-        pubsSS.push(...items);
-        if (items.length < pageSize) break;
+      const wantAll = String(full) === '1' || full === 1 || full === true;
+
+      // loop while time left and either full requested or it's the first page
+      while (timeLeft(started, BUDGET_MS) > 1500) {
+        const pURL = `https://api.semanticscholar.org/graph/v1/author/${ssAuthorId}/papers?limit=${SS_PAGE}&offset=${ssOffset}&fields=${encodeURIComponent(fields)}`;
+        let pageOK = false;
+        try {
+          const pResp = await fetchWithTimeout(pURL, {}, Math.min(4000, timeLeft(started, BUDGET_MS)));
+          if (!pResp.ok) break;
+          const pJson = await pResp.json();
+          const data = Array.isArray(pJson?.data) ? pJson.data : [];
+          pageOK = true;
+
+          const mapped = data
+            .filter(p => (Array.isArray(p.authors) ? p.authors : []).some(a => a?.name && namesSimilar(a.name, name)))
+            .map(p => ({
+              title: p.title || '',
+              year: p.year || null,
+              venue: p.venue || '',
+              url: p.url || '',
+              doi: (p.doi || p?.externalIds?.DOI) || '',
+              authors: (Array.isArray(p.authors) ? p.authors.map(a => a.name).filter(Boolean) : []),
+              type: (Array.isArray(p.publicationTypes) && p.publicationTypes[0]) ? p.publicationTypes[0].toLowerCase() : 'other',
+              origin: 'SS',
+              abstract: p.abstract || ''
+            }))
+            .filter(p => p.title);
+
+          publications.push(...mapped);
+
+          // if fewer than page size, we're done
+          if (data.length < SS_PAGE) { ssOffset += data.length; break; }
+
+          ssOffset += SS_PAGE;
+          if (!wantAll) break; // first page only when not full
+        } catch (e) {
+          console.warn('[APUB] SS page err:', e?.name || e?.message || e);
+          break;
+        }
+        if (!pageOK) break;
       }
     }
-    const publicationsSS = pubsSS
-      .filter(p => (Array.isArray(p.authors) ? p.authors : []).some(a => a?.name && namesSimilar(a.name, name)))
-      .map(p => ({
-        title: p.title || '',
-        year: p.year || null,
-        venue: p.venue || '',
-        url: p.url || '',
-        doi: (p.doi || p?.externalIds?.DOI) || '',
-        authors: (Array.isArray(p.authors) ? p.authors.map(a => a.name).filter(Boolean) : []),
-        type: (Array.isArray(p.publicationTypes) && p.publicationTypes[0]) ? p.publicationTypes[0].toLowerCase() : 'other',
-        origin: 'SS',
-        abstract: p.abstract || ''
-      }))
-      .filter(p => p.title);
 
-    // -- Crossref
-    let publicationsCR = [];
+    // 2B) Crossref — one page for enrichment (best effort)
+    let crItems = [];
     try {
       const cr = new URL('https://api.crossref.org/works');
       cr.searchParams.set('query.author', name);
       const affStr = [affiliation, department].filter(Boolean).join(' ');
       if (affStr) cr.searchParams.set('query.affiliation', affStr);
       cr.searchParams.set('rows', '100');
-      const crResp = await fetch(cr.toString(), { headers: { 'User-Agent': 'ResearchExplorer/1.0 (mailto:contact@example.com)' } });
+      const crResp = await fetchWithTimeout(cr.toString(), { headers: { 'User-Agent': 'ResearchExplorer/1.0 (mailto:contact@example.com)' } }, Math.min(4000, timeLeft(started, BUDGET_MS)));
       if (crResp.ok) {
         const j = await crResp.json();
         const items = j?.message?.items || [];
-        publicationsCR = items
+        crItems = items
           .filter(x => {
             const authors = Array.isArray(x.author) ? x.author : [];
             const nameOk = authors.some(a => namesSimilar(`${a.given || ''} ${a.family || ''}`.trim(), name));
@@ -274,22 +322,24 @@ app.post('/api/authorPublications', async (req, res) => {
           }))
           .filter(p => p.title);
       }
-    } catch (e) { console.warn('[CR] error', e); }
+    } catch (e) {
+      console.warn('[APUB] CR err:', e?.name || e?.message || e);
+    }
 
-    // -- OpenAlex
-    let publicationsOA = [];
+    // 2C) OpenAlex — one page for enrichment (best effort)
+    let oaItems = [];
     try {
-      const oaAuthorSearch = new URL('https://api.openalex.org/authors');
-      oaAuthorSearch.searchParams.set('search', name);
-      oaAuthorSearch.searchParams.set('per-page', '15');
-      const oaAS = await fetch(oaAuthorSearch.toString());
-      if (oaAS.ok) {
-        const ajson = await oaAS.json();
-        const candidates = Array.isArray(ajson?.results) ? ajson.results : [];
-        if (candidates.length) {
+      const aURL = new URL('https://api.openalex.org/authors');
+      aURL.searchParams.set('search', name);
+      aURL.searchParams.set('per-page', '10');
+      const aResp = await fetchWithTimeout(aURL.toString(), {}, Math.min(3000, timeLeft(started, BUDGET_MS)));
+      if (aResp.ok) {
+        const aj = await aResp.json();
+        const cands = Array.isArray(aj?.results) ? aj.results : [];
+        if (cands.length) {
           const affL = affiliation.toLowerCase(), depL = department.toLowerCase();
           let bestOA = null, bestScore = -1;
-          for (const c of candidates) {
+          for (const c of cands) {
             const nm = (c.display_name || '').toLowerCase();
             const inst = (c.last_known_institution?.display_name || '').toLowerCase();
             let s = 0;
@@ -298,65 +348,60 @@ app.post('/api/authorPublications', async (req, res) => {
             if (depL && inst.includes(depL)) s += 1;
             if (s > bestScore) { bestScore = s; bestOA = c; }
           }
-          const target = bestOA || candidates[0];
-          const targetOrcid = target?.orcid?.replace('https://orcid.org/', '') || '';
-          if (target?.id) {
-            const worksUrl = new URL('https://api.openalex.org/works');
-            worksUrl.searchParams.set('per-page', '200');
-            if (targetOrcid) worksUrl.searchParams.set('filter', `author.orcid:${targetOrcid}`);
-            else worksUrl.searchParams.set('filter', `author.display_name:${name}`);
-            const oaW = await fetch(worksUrl.toString());
-            if (oaW.ok) {
-              const wjson = await oaW.json();
-              const works = Array.isArray(wjson?.results) ? wjson.results : [];
-              publicationsOA = works
-                .filter(w => {
-                  const auths = w.authorships || [];
-                  if (targetOrcid) {
-                    return auths.some(a => a?.author?.orcid && a.author.orcid.endsWith(targetOrcid));
-                  }
-                  const nameOk = auths.some(a => namesSimilar(a?.author?.display_name || '', name));
-                  if (!nameOk) return false;
-                  if (!affiliation && !department) return true;
-                  const instStr = auths.map(a => (a.institutions||[]).map(i => i.display_name).join(' ')).join(' ');
-                  return includesAff(instStr, affiliation, department);
-                })
-                .map(w => ({
-                  title: w.title || '',
-                  year: w.publication_year || null,
-                  venue: w.host_venue?.display_name || '',
-                  url: w.primary_location?.landing_page_url || (w.doi ? `https://doi.org/${w.doi}` : ''),
-                  doi: w.doi || '',
-                  authors: (w.authorships || []).map(a => a.author?.display_name).filter(Boolean),
-                  type: (w.type || 'other').toLowerCase(),
-                  origin: 'OA',
-                  abstract: ''
-                }))
-                .filter(p => p.title);
-            }
+          const target = bestOA || cands[0];
+          const orcid = target?.orcid?.replace('https://orcid.org/', '') || '';
+          const wURL = new URL('https://api.openalex.org/works');
+          wURL.searchParams.set('per-page', '100');
+          if (orcid) wURL.searchParams.set('filter', `author.orcid:${orcid}`);
+          else wURL.searchParams.set('filter', `author.display_name:${name}`);
+          const wResp = await fetchWithTimeout(wURL.toString(), {}, Math.min(3500, timeLeft(started, BUDGET_MS)));
+          if (wResp.ok) {
+            const wj = await wResp.json();
+            const works = Array.isArray(wj?.results) ? wj.results : [];
+            oaItems = works.map(w => ({
+              title: w.title || '',
+              year: w.publication_year || null,
+              venue: w.host_venue?.display_name || '',
+              url: w.primary_location?.landing_page_url || (w.doi ? `https://doi.org/${w.doi}` : ''),
+              doi: w.doi || '',
+              authors: (w.authorships || []).map(a => a.author?.display_name).filter(Boolean),
+              type: (w.type || 'other').toLowerCase(),
+              origin: 'OA',
+              abstract: ''
+            }))
+            .filter(p => p.title);
           }
         }
       }
-    } catch (e) { console.warn('[OA] error', e); }
+    } catch (e) {
+      console.warn('[APUB] OA err:', e?.name || e?.message || e);
+    }
 
-    // -- Merge & dedupe
-    const combined = [...publicationsSS, ...publicationsCR, ...publicationsOA];
-    const seen = new Set();
-    const publications = combined.filter(p => {
-      const key = (p.url && p.url.toLowerCase()) || `${(p.title || '').toLowerCase()}::${p.year || ''}`;
-      if (seen.has(key)) return false; seen.add(key); return true;
-    });
+    // --- 3) Merge & dedupe (doi -> url -> title+year) ---
+    const byKey = new Map();
+    const push = (p) => {
+      const k = (p.doi && `doi:${p.doi.toLowerCase()}`) ||
+                (p.url && `url:${p.url.toLowerCase()}`) ||
+                `ty:${(p.title || '').toLowerCase()}::${p.year || ''}`;
+      if (!byKey.has(k)) byKey.set(k, p);
+    };
+    [...publications, ...crItems, ...oaItems].forEach(push);
+    const merged = Array.from(byKey.values());
 
-    // -- Author metrics (SS best effort)
+    // --- 4) Metrics (best effort, quick) ---
     let metrics = {
-      totalPublications: publications.length,
+      totalPublications: merged.length,
       totalCitations: null,
       hIndex: null,
-      lastUpdated: new Date().toISOString().slice(0, 10)
+      lastUpdated: new Date().toISOString().slice(0,10)
     };
     try {
-      if (best?.authorId) {
-        const det = await fetch(`https://api.semanticscholar.org/graph/v1/author/${best.authorId}?fields=hIndex,citationCount,paperCount,updated`);
+      if (ssAuthorId) {
+        const det = await fetchWithTimeout(
+          `https://api.semanticscholar.org/graph/v1/author/${ssAuthorId}?fields=hIndex,citationCount,paperCount,updated`,
+          {},
+          Math.min(2500, timeLeft(started, BUDGET_MS))
+        );
         if (det.ok) {
           const dj = await det.json();
           metrics.totalCitations = Number.isFinite(dj.citationCount) ? dj.citationCount : metrics.totalCitations;
@@ -366,48 +411,52 @@ app.post('/api/authorPublications', async (req, res) => {
       }
     } catch {}
 
-    // -- ALWAYS save to DB
+    // --- 5) ALWAYS save to DB (idempotent upserts in persist.js) ---
     try {
       const { saveFacultyAndPublications } = await import('./src/services/persist.js');
       await saveFacultyAndPublications({
         name,
         college: affiliation || 'Unknown',
         department: department || 'Unknown',
-        externalIds: (best?.authorId || best?.externalIds?.ORCID) ? {
-          ...(best?.authorId ? { semanticScholar: best.authorId } : {}),
-          ...(best?.externalIds?.ORCID ? { orcid: best.externalIds.ORCID } : {})
-        } : {},
-        publications: publications.map(p => ({
-          title: p.title,
-          year: p.year,
-          venue: p.venue,
-          doi: p.doi,
-          url: p.url,
-          abstract: p.abstract || '',
-          externalIds: { [p.origin]: true }
-        })),
+        externalIds: ssAuthorId ? { semanticScholar: ssAuthorId } : {},
+        publications: merged,
         metrics
       });
     } catch (e) {
       console.error('[DB SAVE] failed:', e?.message || e);
-      // still return results even if save fails
+      // continue response anyway
+    }
+
+    // --- 6) Continuation token if time ran out and user asked for full ---
+    let nextToken = null;
+    if (ssAuthorId && (String(full) === '1' || full === 1 || full === true)) {
+      // If there is likely more SS data and we ran out of time, expose next state
+      if (timeLeft(started, BUDGET_MS) < 1200) {
+        nextToken = { ssOffset };
+      } else {
+        // If last page was exactly full page, we probably have more
+        if (merged.length && merged.length % 100 === 0) {
+          nextToken = { ssOffset };
+        }
+      }
     }
 
     res.json({
       ok: true,
-      author: best ? { id: best.authorId, name: best.name } : null,
-      publications,
-      metrics
+      author: best ? { id: ssAuthorId, name: best.name || name } : null,
+      publications: merged,
+      metrics,
+      next: nextToken
     });
   } catch (err) {
     console.error('AUTHOR_PUBLICATIONS_ERROR', err);
-    res.status(500).json({ error: 'Unexpected error' });
+    res.status(200).json({ ok: true, author: null, publications: [], metrics: null, next: null });
   }
 });
 
-/* ---------------------------------------------------------------------------------------
+/* =======================================================================================
    E) DB-first endpoints (unchanged)
---------------------------------------------------------------------------------------- */
+======================================================================================= */
 
 // Faculty list + search
 app.get('/api/faculty', async (req, res, next) => {
@@ -448,7 +497,7 @@ app.get('/api/faculty/:id/publications', async (req, res, next) => {
     const facultyId = req.params.id; // cuid (string)
     const yearFrom  = req.query.yearFrom ? parseInt(req.query.yearFrom, 10) : undefined;
     const yearTo    = req.query.yearTo   ? parseInt(req.query.yearTo,   10) : undefined;
-    const take      = Math.min(parseInt(req.query.limit || '100', 10), 200);
+    const take      = Math.min(parseInt(req.query.limit || '1000', 10), 5000);
 
     const where = { facultyId };
     if (yearFrom || yearTo) {
@@ -500,9 +549,9 @@ app.get('/api/admin/summary', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-/* ---------------------------------------------------------------------------------------
+/* =======================================================================================
    Error handler + root (local dev)
---------------------------------------------------------------------------------------- */
+======================================================================================= */
 app.use((err, req, res, next) => {
   console.error('API error:', err);
   res.status(500).json({ ok: false, error: err?.message || 'Internal Server Error' });

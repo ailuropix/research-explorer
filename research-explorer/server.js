@@ -6,6 +6,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { saveFacultyAndPublications, getAllFaculty, getFacultyPublications, getDepartmentSummary } from './src/services/persist.js';
+// good
+import prisma from './src/db/prisma.js';
+
 
 dotenv.config();
 
@@ -20,9 +23,11 @@ const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Health check
+// must appear early
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, ts: Date.now() });
+  res.json({ ok: true, ts: Date.now(), env: process.env.NODE_ENV || 'dev' });
 });
+
 
 // --- Helpers ---
 const SERPER_API_KEY = process.env.SERPER_API_KEY;

@@ -1,18 +1,12 @@
-// src/db/prisma.js
+// src/db/prisma.js — serverless-safe Prisma singleton (ESM)
 import { PrismaClient } from '@prisma/client';
 
-/**
- * Singleton Prisma client for serverless environments.
- * - In dev (hot reload): reuse via globalThis
- * - In prod (Vercel functions may be warm): reuse instance to avoid connection storms
- */
 const globalForPrisma = globalThis;
 
 export const prisma =
   globalForPrisma.__prisma__ ??
   new PrismaClient({
-    // uncomment to debug SQL:
-    // log: ['query', 'error', 'warn'],
+    // log: ['query', 'error', 'warn'], // uncomment to debug
   });
 
 if (process.env.NODE_ENV !== 'production') {

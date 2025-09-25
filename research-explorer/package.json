@@ -7,6 +7,7 @@
   "type": "module",
   "scripts": {
     "dev": "node server.js",
+    "dev:8081": "set PORT=8081&& node server.js",
     "start": "NODE_ENV=production node server.js",
     "db:up": "docker compose -f docker-compose.db.yml up -d",
     "db:down": "docker compose -f docker-compose.db.yml down",

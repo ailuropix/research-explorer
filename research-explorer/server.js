@@ -1,27 +1,29 @@
+// server.js — minimal, fast import (no top-level I/O)
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import prisma from './src/db/prisma.js'; // singleton, no $connect here
+import prisma from './src/db/prisma.js'; // singleton (no $connect here)
 
 const app = express();
 app.use(express.json());
 
-// ---------- Local static (Vercel serves public/ via vercel.json) ----------
+// ---------- local static (Vercel serves /public via vercel.json) ----------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ---------- quick health (also routed by api/health.js) ----------
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, ts: Date.now() });
+  res.json({ ok: true, ts: Date.now(), env: process.env.NODE_ENV || 'dev' });
 });
 
-// ---------- Faculty search ----------
+// ---------- Faculty list + search ----------
 app.get('/api/faculty', async (req, res, next) => {
   try {
-    const q = (req.query.q || '').trim();
+    const q          = (req.query.q || '').trim();
     const department = (req.query.department || '').trim();
-    const college = (req.query.college || '').trim();
-    const take = Math.min(parseInt(req.query.limit || '50', 10), 100);
+    const college    = (req.query.college || '').trim();
+    const take       = Math.min(parseInt(req.query.limit || '50', 10), 100);
 
     const where = {};
     if (q) {
@@ -51,7 +53,9 @@ app.get('/api/faculty', async (req, res, next) => {
 // ---------- Publications for a faculty ----------
 app.get('/api/faculty/:id/publications', async (req, res, next) => {
   try {
-    const facultyId = req.params.id; // String (cuid)
+    const facultyId = req.params.id; // String cuid
+    if (!facultyId) return res.status(400).json({ ok: false, error: 'Missing faculty id' });
+
     const yearFrom = req.query.yearFrom ? parseInt(req.query.yearFrom, 10) : undefined;
     const yearTo   = req.query.yearTo   ? parseInt(req.query.yearTo,   10) : undefined;
     const take     = Math.min(parseInt(req.query.limit || '100', 10), 200);
@@ -87,10 +91,10 @@ app.get('/api/admin/summary', async (req, res, next) => {
       }
     });
 
-    const totalFaculty = faculty.length;
+    const totalFaculty      = faculty.length;
     const totalPublications = faculty.reduce((s, f) => s + (f.metrics?.totalPublications || 0), 0);
-    const totalCitations   = faculty.reduce((s, f) => s + (f.metrics?.totalCitations   || 0), 0);
-    const avgHIndex = totalFaculty
+    const totalCitations    = faculty.reduce((s, f) => s + (f.metrics?.totalCitations   || 0), 0);
+    const avgHIndex         = totalFaculty
       ? faculty.reduce((s, f) => s + (f.metrics?.hIndex || 0), 0) / totalFaculty
       : 0;
 
@@ -99,7 +103,10 @@ app.get('/api/admin/summary', async (req, res, next) => {
       pubsByYear[p.year] = (pubsByYear[p.year] || 0) + 1;
     }
 
-    res.json({ ok: true, data: { department, totalFaculty, totalPublications, totalCitations, avgHIndex, publicationsByYear: pubsByYear } });
+    res.json({
+      ok: true,
+      data: { department, totalFaculty, totalPublications, totalCitations, avgHIndex, publicationsByYear: pubsByYear }
+    });
   } catch (e) { next(e); }
 });
 

@@ -26,6 +26,27 @@ function renderLoading() {
   summaryContent.textContent = 'Generating summary…';
 }
 
+// ---- API helper (put near top of app.js) ----
+const API_BASE = ""; // same-origin on Vercel and in local dev
+
+async function fetchJSON(input, init = {}) {
+  const res = await fetch(`${API_BASE}${input}`, {
+    headers: { "Content-Type": "application/json", ...(init.headers || {}) },
+    ...init,
+  });
+  const ct = res.headers.get("content-type") || "";
+  const text = await res.text(); // read once
+
+  if (!ct.includes("application/json")) {
+    // surfaced when server returns HTML error pages
+    throw new Error(`Expected JSON but got "${ct || "unknown"}". Body: ${text.slice(0, 200)}...`);
+  }
+  const data = JSON.parse(text);
+  if (!res.ok) throw new Error(data?.error || res.statusText);
+  return data;
+}
+
+
 function rowTemplate(item) {
   let hostname = '';
   try {

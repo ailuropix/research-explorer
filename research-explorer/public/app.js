@@ -1,3 +1,4 @@
+// --- DOM elements ---
 const collegeSelect = document.getElementById('collegeSelect');
 const deptSelect = document.getElementById('deptSelect');
 const facultyInput = document.getElementById('facultyInput');
@@ -8,7 +9,8 @@ const toggleSummary = document.getElementById('toggleSummary');
 const summarySection = document.getElementById('summarySection');
 const collegeOtherInput = document.getElementById('collegeOtherInput');
 const deptOtherInput = document.getElementById('deptOtherInput');
-// Filter/sort controls
+
+// Filters / sort
 const yearFromEl = document.getElementById('yearFrom');
 const yearToEl = document.getElementById('yearTo');
 const venueInputEl = document.getElementById('venueInput');
@@ -17,51 +19,45 @@ const sortSelectEl = document.getElementById('sortSelect');
 const applyFiltersBtn = document.getElementById('applyFilters');
 const includeWebEl = document.getElementById('includeWeb');
 const resultsMetaEl = document.getElementById('resultsMeta');
-// KPI elements
+
+// KPIs
 const kpiTotalPubsEl = document.getElementById('kpiTotalPubs');
 const kpiUpdatedEl = document.getElementById('kpiUpdated');
 
+// --- helpers ---
 function renderLoading() {
   resultsList.innerHTML = '<div class="card"><div>Loading results…</div></div>';
   summaryContent.textContent = 'Generating summary…';
 }
 
-// ---- API helper (put near top of app.js) ----
-const API_BASE = ""; // same-origin on Vercel and in local dev
-
+// unified JSON fetch (forces /api/* to return JSON, nice errors otherwise)
+const API_BASE = '';
 async function fetchJSON(input, init = {}) {
   const res = await fetch(`${API_BASE}${input}`, {
-    headers: { "Content-Type": "application/json", ...(init.headers || {}) },
+    headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
     ...init,
   });
-  const ct = res.headers.get("content-type") || "";
-  const text = await res.text(); // read once
-
-  if (!ct.includes("application/json")) {
-    // surfaced when server returns HTML error pages
-    throw new Error(`Expected JSON but got "${ct || "unknown"}". Body: ${text.slice(0, 200)}...`);
+  const ct = res.headers.get('content-type') || '';
+  const text = await res.text();
+  if (!ct.includes('application/json')) {
+    throw new Error(`Expected JSON but got "${ct}". Body: ${text.slice(0, 200)}...`);
   }
   const data = JSON.parse(text);
   if (!res.ok) throw new Error(data?.error || res.statusText);
   return data;
 }
 
-
 function rowTemplate(item) {
   let hostname = '';
-  try {
-    hostname = item.link ? new URL(item.link).hostname : '';
-  } catch (_) {
-    hostname = '';
-  }
+  try { hostname = item.link ? new URL(item.link).hostname : ''; } catch (_) { hostname = ''; }
   const hasDOI = !!(item.doi && String(item.doi).trim());
   const doiSlug = hasDOI ? String(item.doi).replace(/^https?:\/\/doi\.org\//i, '') : '';
-  const actionParts = [];
-  if (item.link) actionParts.push(`<button class="view-btn" data-link="${item.link}">View</button>`);
-  if (hasDOI) actionParts.push(`<button class="view-btn open-doi-btn" data-doi="${doiSlug}">Open DOI</button>`);
-  if (hasDOI) actionParts.push(`<button class="view-btn copy-doi-btn" data-doi="${doiSlug}">Copy DOI</button>`);
-  const action = actionParts.join(' ');
-  const safe = (v) => (v == null ? '' : String(v));
+  const action = [
+    item.link ? `<button class="view-btn" data-link="${item.link}">View</button>` : '',
+    hasDOI ? `<button class="view-btn open-doi-btn" data-doi="${doiSlug}">Open DOI</button>` : '',
+    hasDOI ? `<button class="view-btn copy-doi-btn" data-doi="${doiSlug}">Copy DOI</button>` : '',
+  ].filter(Boolean).join(' ');
+  const safe = v => (v == null ? '' : String(v));
   const authors = Array.isArray(item.authors) ? item.authors.join(', ') : '';
   return `
     <tr>
@@ -77,39 +73,30 @@ function rowTemplate(item) {
 
 function bindCardButtons() {
   resultsList.querySelectorAll('.view-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const link = btn.getAttribute('data-link');
-      window.open(link, '_blank', 'noopener');
-    });
-  });
-  // Open DOI buttons
-  resultsList.querySelectorAll('.open-doi-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const doi = btn.getAttribute('data-doi');
-      if (doi) window.open(`https://doi.org/${doi}`, '_blank', 'noopener');
-    });
-  });
-  // Copy DOI buttons
-  resultsList.querySelectorAll('.copy-doi-btn').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const doi = btn.getAttribute('data-doi');
-      if (!doi) return;
-      try {
-        await navigator.clipboard.writeText(doi);
-        btn.textContent = 'Copied!';
-        setTimeout(() => { btn.textContent = 'Copy DOI'; }, 1000);
-      } catch (_) {
-        // Fallback: create temporary input
-        const el = document.createElement('input');
-        el.value = doi;
-        document.body.appendChild(el);
-        el.select();
-        document.execCommand('copy');
-        document.body.removeChild(el);
-        btn.textContent = 'Copied!';
-        setTimeout(() => { btn.textContent = 'Copy DOI'; }, 1000);
-      }
-    });
+    const doi = btn.getAttribute('data-doi');
+    const link = btn.getAttribute('data-link');
+    if (btn.classList.contains('open-doi-btn') && doi) {
+      btn.addEventListener('click', () => window.open(`https://doi.org/${doi}`, '_blank', 'noopener'));
+    } else if (btn.classList.contains('copy-doi-btn') && doi) {
+      btn.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(doi);
+          btn.textContent = 'Copied!';
+          setTimeout(() => (btn.textContent = 'Copy DOI'), 1000);
+        } catch {
+          const el = document.createElement('input');
+          el.value = doi;
+          document.body.appendChild(el);
+          el.select();
+          document.execCommand('copy');
+          document.body.removeChild(el);
+          btn.textContent = 'Copied!';
+          setTimeout(() => (btn.textContent = 'Copy DOI'), 1000);
+        }
+      });
+    } else if (link) {
+      btn.addEventListener('click', () => window.open(link, '_blank', 'noopener'));
+    }
   });
 }
 
@@ -120,12 +107,11 @@ function renderResults(items) {
   if (!items || items.length === 0) {
     resultsList.innerHTML = '<div class="card"><div>No results found.</div></div>';
     if (resultsMetaEl) {
-      const totalPubs = __totalPublications || 0;
-      resultsMetaEl.innerHTML = `<span class="results-count">0 shown</span> • <span class="pubs-count">0</span> / <span class=\"pubs-total\">${totalPubs}</span> publications`;
+      resultsMetaEl.innerHTML = `<span class="results-count">0 shown</span> • <span class="pubs-count">0</span> / <span class="pubs-total">${__totalPublications || 0}</span> publications`;
     }
     return;
   }
-  const header = `
+  resultsList.innerHTML = `
     <table class="results-table" role="table">
       <thead>
         <tr>
@@ -137,19 +123,30 @@ function renderResults(items) {
           <th scope="col">Action</th>
         </tr>
       </thead>
-      <tbody>
-        ${items.map(rowTemplate).join('')}
-      </tbody>
+      <tbody>${items.map(rowTemplate).join('')}</tbody>
     </table>
   `;
-  resultsList.innerHTML = header;
   bindCardButtons();
 }
 
-function parseYear(val) {
-  const n = Number(val);
-  if (!Number.isFinite(n)) return null;
-  return n;
+const parseYear = v => (Number.isFinite(+v) ? +v : null);
+
+function isPublicationLike(href) {
+  if (!href) return false;
+  try {
+    const u = new URL(href);
+    const host = (u.hostname || '').toLowerCase();
+    const path = (u.pathname || '').toLowerCase();
+    const pubHosts = new Set([
+      'arxiv.org','ieeexplore.ieee.org','dl.acm.org','link.springer.com','sciencedirect.com','www.sciencedirect.com',
+      'nature.com','www.nature.com','mdpi.com','www.mdpi.com','onlinelibrary.wiley.com','tandfonline.com','www.tandfonline.com',
+      'ncbi.nlm.nih.gov','pubmed.ncbi.nlm.nih.gov','researchgate.net','www.researchgate.net','openaccess.thecvf.com',
+      'papers.nips.cc','ojs.aaai.org','proceedings.mlr.press'
+    ]);
+    const pubPathHints = ['/doi/','/abs/','/article/','/document/','/paper/','/publication/'];
+    if (pubHosts.has(host)) return host.includes('researchgate.net') ? path.includes('/publication/') : true;
+    return pubPathHints.some(h => path.includes(h));
+  } catch { return false; }
 }
 
 function applyFiltersSort() {
@@ -162,114 +159,54 @@ function applyFiltersSort() {
 
   let arr = __allItems.slice();
   arr = arr.filter(it => {
-    // publications-only by default
-    const itemType = (it.type || 'web').toLowerCase();
-    if (!includeWeb && itemType === 'web') return false;
-    // if web results are included, keep only publication-like web links
-    if (includeWeb && itemType === 'web') {
-      if (!isPublicationLike(it.link)) return false;
-    }
+    const t = (it.type || 'web').toLowerCase();
+    if (!includeWeb && t === 'web') return false;
+    if (includeWeb && t === 'web' && !isPublicationLike(it.link)) return false;
     if (yf && it.year && it.year < yf) return false;
     if (yt && it.year && it.year > yt) return false;
     if (venueQ && (!it.venue || !it.venue.toLowerCase().includes(venueQ))) return false;
-    if (typeQ !== 'any') {
-      const t = itemType;
-      if (t !== typeQ) return false;
-    }
+    if (typeQ !== 'any' && t !== typeQ) return false;
     return true;
   });
 
-  if (sort === 'yearDesc') {
-    arr.sort((a, b) => (b.year || -Infinity) - (a.year || -Infinity));
-  } else if (sort === 'yearAsc') {
-    arr.sort((a, b) => (a.year || Infinity) - (b.year || Infinity));
-  } // relevance = keep original order
+  if (sort === 'yearDesc') arr.sort((a, b) => (b.year || -Infinity) - (a.year || -Infinity));
+  else if (sort === 'yearAsc') arr.sort((a, b) => (a.year || Infinity) - (b.year || Infinity));
 
   renderResults(arr);
-  // Update counts
   if (resultsMetaEl) {
     const pubs = arr.filter(x => (x.type || 'web') !== 'web').length;
-    const totalPubs = __totalPublications || pubs;
-    resultsMetaEl.innerHTML = `<span class="results-count">${arr.length} shown</span> • <span class="pubs-count">${pubs}</span> / <span class=\"pubs-total\">${totalPubs}</span> publications`;
+    resultsMetaEl.innerHTML = `<span class="results-count">${arr.length} shown</span> • <span class="pubs-count">${pubs}</span> / <span class="pubs-total">${__totalPublications || pubs}</span> publications`;
   }
 }
 
-function isPublicationLike(href) {
-  if (!href) return false;
-  try {
-    const u = new URL(href);
-    const host = (u.hostname || '').toLowerCase();
-    const path = (u.pathname || '').toLowerCase();
-    const pubHosts = new Set([
-      'arxiv.org',
-      'ieeexplore.ieee.org',
-      'dl.acm.org',
-      'link.springer.com',
-      'sciencedirect.com',
-      'www.sciencedirect.com',
-      'nature.com',
-      'www.nature.com',
-      'mdpi.com',
-      'www.mdpi.com',
-      'onlinelibrary.wiley.com',
-      'tandfonline.com',
-      'www.tandfonline.com',
-      'ncbi.nlm.nih.gov',
-      'pubmed.ncbi.nlm.nih.gov',
-      'researchgate.net',
-      'www.researchgate.net',
-      'openaccess.thecvf.com',
-      'papers.nips.cc',
-      'ojs.aaai.org',
-      'proceedings.mlr.press'
-    ]);
-    const pubPathHints = ['/doi/', '/abs/', '/article/', '/document/', '/paper/', '/publication/'];
-    if (pubHosts.has(host)) {
-      // For ResearchGate, ensure it points to a publication page
-      if (host.includes('researchgate.net')) return path.includes('/publication/');
-      return true;
-    }
-    return pubPathHints.some(h => path.includes(h));
-  } catch (_) {
-    return false;
-  }
-}
-
+// --- MAIN SEARCH PIPELINE (single, final version) ---
 async function searchAndSummarize(query, opts = {}) {
   try {
     renderLoading();
-    // Default sort to Year ↓ when we have a faculty name
-    if (opts?.name && sortSelectEl) {
-      sortSelectEl.value = 'yearDesc';
-    }
+    if (opts?.name && sortSelectEl) sortSelectEl.value = 'yearDesc';
 
-    // Kick off two requests in parallel: web query+summary and author publications
-    const webPromise = fetch('/api/query', {
+    // web search + summary
+    const webPromise = fetchJSON('/api/query', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query })
     });
 
-    // Try to infer faculty name from query (first token(s) before known words)
+    // publications by author
     const maybeName = opts.name || facultyInput.value?.trim();
-    const pubsPayload = maybeName ? {
-      name: maybeName,
-      affiliation: opts.affiliation || '',
-      department: opts.department || ''
-    } : null;
     const pubsPromise = maybeName
-      ? fetch('/api/authorPublications', {
+      ? fetchJSON('/api/authorPublications', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(pubsPayload)
+          body: JSON.stringify({
+            name: maybeName,
+            affiliation: opts.affiliation || '',
+            department: opts.department || ''
+          })
         })
       : null;
 
-    const resp = await webPromise;
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || 'Request failed');
+    const data = await webPromise;
+    if (!data) throw new Error('Empty response from /api/query');
 
-    // Prepare base items from web search
     const baseItems = (Array.isArray(data.items) ? data.items : []).map(it => ({
       title: it.title,
       snippet: it.snippet,
@@ -280,30 +217,22 @@ async function searchAndSummarize(query, opts = {}) {
       type: 'web'
     }));
 
-    // Attempt to retrieve publications and merge
     let pubItems = [];
     if (pubsPromise) {
       try {
-        const presp = await pubsPromise;
-        const pjson = await presp.json();
-        if (presp.ok && Array.isArray(pjson.publications)) {
-          pubItems = pjson.publications.map(pub => {
-            const link = pub.url || '';
-            let hostname = '';
-            try { hostname = link ? new URL(link).hostname : ''; } catch (_) {}
-            return {
-              title: pub.title,
-              snippet: [pub.venue || '', pub.year || ''].filter(Boolean).join(' • '),
-              link,
-              source: hostname || 'publication',
-              year: pub.year || null,
-              venue: pub.venue || '',
-              type: (pub.type || 'other').toLowerCase(),
-              authors: Array.isArray(pub.authors) ? pub.authors : [],
-              doi: pub.doi || ''
-            };
-          });
-          // Update KPI cards if available
+        const pjson = await pubsPromise;
+        if (Array.isArray(pjson.publications)) {
+          pubItems = pjson.publications.map(pub => ({
+            title: pub.title,
+            snippet: [pub.venue || '', pub.year || ''].filter(Boolean).join(' • '),
+            link: pub.url || '',
+            source: pub.url ? new URL(pub.url).hostname : 'publication',
+            year: pub.year || null,
+            venue: pub.venue || '',
+            type: (pub.type || 'other').toLowerCase(),
+            authors: Array.isArray(pub.authors) ? pub.authors : [],
+            doi: pub.doi || ''
+          }));
           if (pjson.metrics) {
             if (kpiTotalPubsEl) kpiTotalPubsEl.textContent = String(pjson.metrics.totalPublications ?? pubItems.length);
             if (kpiUpdatedEl) {
@@ -316,34 +245,26 @@ async function searchAndSummarize(query, opts = {}) {
           }
         }
       } catch (e) {
-        console.warn('Publications fetch/parse failed', e);
-        if (kpiTotalPubsEl) kpiTotalPubsEl.textContent = '—';
-        if (kpiUpdatedEl) kpiUpdatedEl.textContent = '—';
+        console.warn('Publications fetch failed', e);
       }
     }
 
-    // Merge and de-duplicate by link
-    const mergedItems = [...baseItems, ...pubItems];
+    const merged = [...baseItems, ...pubItems];
     const seen = new Set();
-    __allItems = mergedItems.filter(it => {
+    __allItems = merged.filter(it => {
       const k = it.link || '';
-      if (!k) return true; // keep items without link
+      if (!k) return true;
       if (seen.has(k)) return false;
       seen.add(k);
       return true;
     });
-    // Capture total publications after initial merge
     __totalPublications = __allItems.filter(x => (x.type || 'web') !== 'web').length;
-    if (kpiTotalPubsEl && !isNaN(__totalPublications)) {
-      kpiTotalPubsEl.textContent = String(__totalPublications);
-    }
+    if (kpiTotalPubsEl) kpiTotalPubsEl.textContent = String(__totalPublications);
+
     applyFiltersSort();
 
-    // Render summary
     summaryContent.textContent = data.summary || 'No summary available.';
     summarySection.style.display = 'block';
-
-    // Publications are now merged into results list
   } catch (err) {
     console.error(err);
     resultsList.innerHTML = `<div class="card"><div>Error: ${String(err.message || err)}</div></div>`;
@@ -351,77 +272,36 @@ async function searchAndSummarize(query, opts = {}) {
   }
 }
 
-// Bind filters
-if (applyFiltersBtn) applyFiltersBtn.addEventListener('click', applyFiltersSort);
-if (yearFromEl) yearFromEl.addEventListener('keydown', e => { if (e.key === 'Enter') applyFiltersSort(); });
-if (yearToEl) yearToEl.addEventListener('keydown', e => { if (e.key === 'Enter') applyFiltersSort(); });
-if (venueInputEl) venueInputEl.addEventListener('keydown', e => { if (e.key === 'Enter') applyFiltersSort(); });
-if (typeSelectEl) typeSelectEl.addEventListener('change', applyFiltersSort);
-if (sortSelectEl) sortSelectEl.addEventListener('change', applyFiltersSort);
-if (includeWebEl) includeWebEl.addEventListener('change', applyFiltersSort);
-
+// --- UI wiring ---
 function onFindPublications() {
-  // Resolve actual values, using custom inputs if 'Others' is chosen
-  const college = (collegeSelect.value === 'Others'
-    ? (collegeOtherInput.value || '').trim()
-    : (collegeSelect.value || '').trim());
-  const dept = (deptSelect.value === 'Others'
-    ? (deptOtherInput.value || '').trim()
-    : (deptSelect.value || '').trim());
+  const college = (collegeSelect.value === 'Others' ? (collegeOtherInput.value || '').trim() : (collegeSelect.value || '').trim());
+  const dept    = (deptSelect.value === 'Others'   ? (deptOtherInput.value || '').trim()   : (deptSelect.value || '').trim());
   const faculty = (facultyInput.value || '').trim();
-  if (!faculty) {
-    facultyInput.focus();
-    return;
-  }
-  if ((collegeSelect.value === 'Others') && !college) {
-    collegeOtherInput.focus();
-    return;
-  }
-  if ((deptSelect.value === 'Others') && !dept) {
-    deptOtherInput.focus();
-    return;
-  }
-  // Construct a targeted query combining faculty, department, and college
-  const parts = [];
-  if (faculty) parts.push(faculty);
-  if (dept) parts.push(dept);
-  if (college) parts.push(college);
+
+  if (!faculty) return facultyInput.focus();
+  if ((collegeSelect.value === 'Others') && !college) return collegeOtherInput.focus();
+  if ((deptSelect.value === 'Others') && !dept) return deptOtherInput.focus();
+
+  const parts = [faculty, dept, college].filter(Boolean);
   parts.push('publications');
-  const q = parts.join(' ');
-  searchAndSummarize(q, { name: faculty, affiliation: college, department: dept });
+
+  searchAndSummarize(parts.join(' '), { name: faculty, affiliation: college, department: dept });
 }
 
 findBtn.addEventListener('click', onFindPublications);
-facultyInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') onFindPublications();
-});
+facultyInput.addEventListener('keydown', e => { if (e.key === 'Enter') onFindPublications(); });
 
 function syncOthersVisibility() {
-  const showCollegeOther = collegeSelect.value === 'Others';
-  collegeOtherInput.style.display = showCollegeOther ? 'block' : 'none';
-  const showDeptOther = deptSelect.value === 'Others';
-  deptOtherInput.style.display = showDeptOther ? 'block' : 'none';
+  collegeOtherInput.style.display = (collegeSelect.value === 'Others') ? 'block' : 'none';
+  deptOtherInput.style.display    = (deptSelect.value === 'Others')    ? 'block' : 'none';
 }
-
 collegeSelect.addEventListener('change', syncOthersVisibility);
 deptSelect.addEventListener('change', syncOthersVisibility);
-// Initialize visibility on load
 syncOthersVisibility();
 
 toggleSummary.addEventListener('click', () => {
-  const content = summaryContent;
-  const isHidden = content.style.display === 'none';
-  content.style.display = isHidden ? 'block' : 'none';
-  toggleSummary.textContent = isHidden ? 'Hide' : 'Show';
-  toggleSummary.setAttribute('aria-expanded', String(isHidden));
+  const hidden = summaryContent.style.display === 'none';
+  summaryContent.style.display = hidden ? 'block' : 'none';
+  toggleSummary.textContent = hidden ? 'Hide' : 'Show';
+  toggleSummary.setAttribute('aria-expanded', String(hidden));
 });
-
-// GOOD:
-await fetch(`/api/faculty?q=${encodeURIComponent(name)}&department=${encodeURIComponent(dept)}&college=${encodeURIComponent(college)}`)
-
-await fetch(`/api/faculty/${facultyId}/publications?yearFrom=${y1}&yearTo=${y2}`)
-
-// BAD (returns HTML → “Unexpected token '<'”):
-// fetch('/faculty?...')
-// fetch('/search?...')
-

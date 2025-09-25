@@ -394,3 +394,13 @@ toggleSummary.addEventListener('click', () => {
   toggleSummary.textContent = isHidden ? 'Hide' : 'Show';
   toggleSummary.setAttribute('aria-expanded', String(isHidden));
 });
+
+// GOOD:
+await fetch(`/api/faculty?q=${encodeURIComponent(name)}&department=${encodeURIComponent(dept)}&college=${encodeURIComponent(college)}`)
+
+await fetch(`/api/faculty/${facultyId}/publications?yearFrom=${y1}&yearTo=${y2}`)
+
+// BAD (returns HTML → “Unexpected token '<'”):
+// fetch('/faculty?...')
+// fetch('/search?...')
+

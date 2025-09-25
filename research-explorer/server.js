@@ -151,36 +151,43 @@ app.post('/api/summarize', async (req, res) => {
 /* =======================================================================================
    C) Compose search + (optional) summary — POST /api/query
 ======================================================================================= */
+// ===== FAST /api/query (replace your existing /api/query handler) =====
 app.post('/api/query', async (req, res) => {
   try {
     const { query } = req.body || {};
     if (!query) return res.status(400).json({ error: 'Missing query' });
 
-    let items = [];
-    if (process.env.SERPER_API_KEY) {
-      try {
-        const r = await fetch('https://google.serper.dev/search', {
-          method: 'POST',
-          headers: { 'X-API-KEY': process.env.SERPER_API_KEY, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ q: query, gl: 'in', num: 8 })
-        });
-        if (r.ok) {
-          const j = await r.json();
-          const seen = new Set();
-          items = [...(j.organic || [])].map(it => ({
-            title: it.title || '',
-            snippet: it.snippet || '',
-            link: it.link || it.url || '',
-            source: (() => { try { return new URL(it.link || it.url || '').hostname; } catch { return 'web'; } })()
-          })).filter(x => x.title && x.link && !seen.has(x.link) && seen.add(x.link));
-        }
-      } catch { /* ignore */ }
+    // Fast path: if no Serper key, just return empty items (prevents 504)
+    if (!process.env.SERPER_API_KEY) {
+      return res.json({ ok: true, items: [], summary: '' });
     }
 
-    // Skip Gemini to guarantee we never hit the cap
+    // Small search with tight budget
+    const r = await fetch('https://google.serper.dev/search', {
+      method: 'POST',
+      headers: { 'X-API-KEY': process.env.SERPER_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q: query, gl: 'in', num: 8 })
+    });
+
+    let items = [];
+    if (r.ok) {
+      const j = await r.json();
+      const seen = new Set();
+      items = (j.organic || [])
+        .map(it => ({
+          title: it.title || '',
+          snippet: it.snippet || '',
+          link: it.link || it.url || '',
+          source: (() => { try { return new URL(it.link || it.url || '').hostname; } catch { return 'web'; } })()
+        }))
+        .filter(x => x.title && x.link && !seen.has(x.link) && seen.add(x.link));
+    }
+
+    // No Gemini summary — keeps us well under the 10s cap
     res.json({ ok: true, items, summary: '' });
   } catch (err) {
     console.error('QUERY_ERROR', err);
+    // Always return JSON so the frontend doesn’t choke on text/plain
     res.json({ ok: true, items: [], summary: '' });
   }
 });
@@ -193,13 +200,14 @@ app.post('/api/query', async (req, res) => {
      Keep calling with that token until `next` is null.
    - Response shape: { ok, author, publications, metrics, next? }
 ======================================================================================= */
+// ===== FAST /api/authorPublications (replace your existing handler) =====
 app.post('/api/authorPublications', async (req, res) => {
   const t0 = Date.now();
   try {
     const { name, affiliation = '', department = '' } = req.body || {};
     if (!name) return res.status(400).json({ error: 'Missing name' });
 
-    // 1) Find best author on SS (quick)
+    // 1) Find best SS author (single quick call)
     let best = null;
     try {
       const url = `https://api.semanticscholar.org/graph/v1/author/search?query=${encodeURIComponent(name)}&limit=10`;
@@ -219,10 +227,12 @@ app.post('/api/authorPublications', async (req, res) => {
           })
           .sort((a,b) => b.score - a.score)[0]?.c || cands[0] || null;
       }
-    } catch {}
+    } catch (e) {
+      console.warn('[APUB] SS author lookup failed:', e?.message || e);
+    }
 
+    // 2) First page of SS papers (limit=100), filter by author name
     const pubs = [];
-    // 2) First page of SS papers (limit=100) – fast and within cap
     if (best?.authorId) {
       const fields = 'title,year,venue,url,authors,externalIds,publicationTypes,abstract';
       const url = `https://api.semanticscholar.org/graph/v1/author/${best.authorId}/papers?limit=100&offset=0&fields=${encodeURIComponent(fields)}`;
@@ -232,7 +242,8 @@ app.post('/api/authorPublications', async (req, res) => {
           const j = await r.json();
           const data = Array.isArray(j?.data) ? j.data : [];
           for (const p of data) {
-            const hasName = (Array.isArray(p.authors) ? p.authors : []).some(a => a?.name && a.name.toLowerCase().includes(name.toLowerCase()));
+            const authors = Array.isArray(p.authors) ? p.authors : [];
+            const hasName = authors.some(a => a?.name && a.name.toLowerCase().includes(name.toLowerCase()));
             if (!hasName) continue;
             pubs.push({
               title: p.title || '',
@@ -240,14 +251,16 @@ app.post('/api/authorPublications', async (req, res) => {
               venue: p.venue || '',
               url: p.url || '',
               doi: (p.doi || p?.externalIds?.DOI) || '',
-              authors: (Array.isArray(p.authors) ? p.authors.map(a => a.name).filter(Boolean) : []),
+              authors: authors.map(a => a.name).filter(Boolean),
               type: (Array.isArray(p.publicationTypes) && p.publicationTypes[0]) ? p.publicationTypes[0].toLowerCase() : 'other',
               origin: 'SS',
               abstract: p.abstract || ''
             });
           }
         }
-      } catch {}
+      } catch (e) {
+        console.warn('[APUB] SS papers failed:', e?.message || e);
+      }
     }
 
     // 3) Dedupe (doi -> url -> title+year)
@@ -268,7 +281,7 @@ app.post('/api/authorPublications', async (req, res) => {
       lastUpdated: new Date().toISOString().slice(0,10)
     };
 
-    // 5) ALWAYS save to DB (your persist.js already handles upserts)
+    // 5) ALWAYS save to DB (idempotent upserts handled in persist.js)
     try {
       const { saveFacultyAndPublications } = await import('./src/services/persist.js');
       await saveFacultyAndPublications({
@@ -292,6 +305,7 @@ app.post('/api/authorPublications', async (req, res) => {
     });
   } catch (err) {
     console.error('AUTHOR_PUBLICATIONS_ERROR', err);
+    // Always return JSON so the frontend doesn’t see text/plain and crash
     res.json({ ok: true, author: null, publications: [], metrics: null, elapsedMs: Date.now() - t0 });
   }
 });

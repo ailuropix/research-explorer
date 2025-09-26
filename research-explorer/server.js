@@ -150,96 +150,68 @@ app.post('/api/summarize', async (req, res) => {
 
 /* =======================================================================================
    C) Compose search + (optional) summary — POST /api/query
+   (kept fast to avoid 504s)
 ======================================================================================= */
-// ===== FAST /api/query (replace your existing /api/query handler) =====
 app.post('/api/query', async (req, res) => {
   try {
     const { query } = req.body || {};
     if (!query) return res.status(400).json({ error: 'Missing query' });
 
-    // Fast path: if no Serper key, just return empty items (prevents 504)
-    if (!process.env.SERPER_API_KEY) {
-      return res.json({ ok: true, items: [], summary: '' });
-    }
-
-    // Small search with tight budget
-    const r = await fetch('https://google.serper.dev/search', {
-      method: 'POST',
-      headers: { 'X-API-KEY': process.env.SERPER_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q: query, gl: 'in', num: 8 })
-    });
-
     let items = [];
-    if (r.ok) {
-      const j = await r.json();
-      const seen = new Set();
-      items = (j.organic || [])
-        .map(it => ({
-          title: it.title || '',
-          snippet: it.snippet || '',
-          link: it.link || it.url || '',
-          source: (() => { try { return new URL(it.link || it.url || '').hostname; } catch { return 'web'; } })()
-        }))
-        .filter(x => x.title && x.link && !seen.has(x.link) && seen.add(x.link));
+    if (SERPER_API_KEY) {
+      const r = await fetchWithTimeout('https://google.serper.dev/search', {
+        method: 'POST',
+        headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q: query, gl: 'in', num: 8 })
+      }, 7000);
+      if (r.ok) {
+        const j = await r.json();
+        const seen = new Set();
+        items = (j.organic || [])
+          .map(it => ({
+            title: it.title || '',
+            snippet: it.snippet || '',
+            link: it.link || it.url || '',
+            source: (() => { try { return new URL(it.link || it.url || '').hostname; } catch { return 'web'; } })()
+          }))
+          .filter(x => x.title && x.link && !seen.has(x.link) && seen.add(x.link));
+      }
     }
 
-    // No Gemini summary — keeps us well under the 10s cap
     res.json({ ok: true, items, summary: '' });
   } catch (err) {
     console.error('QUERY_ERROR', err);
-    // Always return JSON so the frontend doesn’t choke on text/plain
     res.json({ ok: true, items: [], summary: '' });
   }
 });
 
-
 /* =======================================================================================
-   D) Author publications (SCRAPE + ALWAYS SAVE) — POST /api/authorPublications
-   - Returns ALL publications from Semantic Scholar by paging.
-   - To fetch every page within Vercel 10s: use `full=1` and the API may return `next` token.
-     Keep calling with that token until `next` is null.
-   - Response shape: { ok, author, publications, metrics, next? }
+   D) Author publications — OpenAlex ONLY (scrape + ALWAYS SAVE + continuation tokens)
+   Request body:
+     { name, affiliation?, department?, next? }  // next = { oaCursor: "..." } from previous response
+   Response:
+     { ok, source:"openalex", author, publications:[...], metrics, next? }
 ======================================================================================= */
-// ===== FAST /api/authorPublications (replace your existing handler) =====
-// ===== /api/authorPublications — OpenAlex-only (fast, paged within time budget) =====
 app.post('/api/authorPublications', async (req, res) => {
   const started = Date.now();
-  const BUDGET_MS = 9000; // keep under Vercel 10s
-  const WORKS_PAGE = 200; // OpenAlex max per page when using cursor
+  const BUDGET_MS = 9000;        // stay under Vercel 10s
+  const WORKS_PAGE = 200;        // OpenAlex with cursor supports up to 200 per page
 
-  // local helper (use the one you already have if defined globally)
-  function timeLeft() { return Math.max(0, BUDGET_MS - (Date.now() - started)); }
-  function fetchWithTimeout(url, opts = {}, ms = 5000) {
-    const ctrl = new AbortController();
-    const id = setTimeout(() => ctrl.abort(), ms);
-    return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(id));
-  }
-  const namesSimilar = (a = '', b = '') => {
-    const A = a.toLowerCase().trim().replace(/\s+/g, ' ');
-    const B = b.toLowerCase().trim().replace(/\s+/g, ' ');
-    if (!A || !B) return false;
-    if (A === B || A.includes(B) || B.includes(A)) return true;
-    const ap = A.split(/\s+/), bp = B.split(/\s+/);
-    const aLast = ap[ap.length-1], bLast = bp[bp.length-1];
-    if (aLast !== bLast) return false;
-    const aFirst = ap[0], bFirst = bp[0];
-    if (aFirst === bFirst) return true;
-    if ((aFirst.length === 1 && bFirst.startsWith(aFirst)) || (bFirst.length === 1 && aFirst.startsWith(bFirst))) return true;
-    return false;
-  };
+  const timeLeftLocal = () => timeLeft(started, BUDGET_MS);
+  const fetchTO = (url, opts, ms) => fetchWithTimeout(url, opts, Math.min(ms, timeLeftLocal()));
 
   try {
-    const { name, affiliation = '', department = '' } = req.body || {};
+    const { name, affiliation = '', department = '', next } = req.body || {};
     if (!name) return res.status(400).json({ error: 'Missing name' });
 
-    // 1) Find best-matching author in OpenAlex
+    // 1) Find best author in OpenAlex
     let author = null;
     try {
       const aURL = new URL('https://api.openalex.org/authors');
       aURL.searchParams.set('search', name);
       aURL.searchParams.set('per-page', '15');
 
-      const aResp = await fetchWithTimeout(aURL.toString(), {}, Math.min(4000, timeLeft()));
+      const aResp = await fetchTO(aURL.toString(), {}, 4000);
       if (aResp.ok) {
         const aJson = await aResp.json();
         const cands = Array.isArray(aJson?.results) ? aJson.results : [];
@@ -263,23 +235,26 @@ app.post('/api/authorPublications', async (req, res) => {
     }
 
     if (!author) {
-      return res.json({ ok: true, source: 'openalex', author: null, publications: [], metrics: null, elapsedMs: Date.now() - started });
+      return res.json({ ok: true, source: 'openalex', author: null, publications: [], metrics: null, next: null });
     }
 
-    // 2) Fetch works using cursor pagination within time budget
+    // 2) Works with cursor pagination (resume via next.oaCursor if provided)
     const orcid = author?.orcid?.replace('https://orcid.org/', '') || '';
-    const works = [];
+    const publications = [];
+    let cursor = (next && next.oaCursor) ? next.oaCursor : '*';
+    let lastCursorUsed = cursor;
+
     try {
-      let cursor = '*';
-      while (timeLeft() > 1200 && cursor) {
+      while (timeLeftLocal() > 1200 && cursor) {
         const wURL = new URL('https://api.openalex.org/works');
         wURL.searchParams.set('per-page', String(WORKS_PAGE));
         wURL.searchParams.set('cursor', cursor);
         if (orcid) wURL.searchParams.set('filter', `author.orcid:${orcid}`);
-        else wURL.searchParams.set('filter', `author.display_name:${name}`);
+        else       wURL.searchParams.set('filter', `author.display_name:${name}`);
 
-        const wResp = await fetchWithTimeout(wURL.toString(), {}, Math.min(3500, timeLeft()));
+        const wResp = await fetchTO(wURL.toString(), {}, 3500);
         if (!wResp.ok) break;
+
         const wj = await wResp.json();
         const batch = Array.isArray(wj?.results) ? wj.results : [];
         for (const w of batch) {
@@ -289,7 +264,7 @@ app.post('/api/authorPublications', async (req, res) => {
             : auths.some(a => namesSimilar(a?.author?.display_name || '', name));
           if (!nameOk) continue;
 
-          works.push({
+          publications.push({
             title: w.title || '',
             year: w.publication_year || null,
             venue: w.host_venue?.display_name || '',
@@ -302,9 +277,12 @@ app.post('/api/authorPublications', async (req, res) => {
           });
         }
 
-        // next cursor (OpenAlex gives meta.next_cursor); stop if none or small page
+        // next cursor (OpenAlex returns meta.next_cursor). If null -> done.
+        lastCursorUsed = cursor;
         cursor = wj?.meta?.next_cursor || null;
-        if (!cursor) break;
+
+        // If page returned less than requested, likely the last one.
+        if (!cursor || (batch.length < WORKS_PAGE)) break;
       }
     } catch (e) {
       console.warn('[OA] works pagination failed:', e?.message || e);
@@ -312,17 +290,17 @@ app.post('/api/authorPublications', async (req, res) => {
 
     // 3) Dedupe: doi -> url -> title+year
     const byKey = new Map();
-    for (const p of works) {
+    for (const p of publications) {
       const k = (p.doi && `doi:${p.doi.toLowerCase()}`) ||
                 (p.url && `url:${p.url.toLowerCase()}`) ||
                 `ty:${(p.title || '').toLowerCase()}::${p.year || ''}`;
       if (!byKey.has(k)) byKey.set(k, p);
     }
-    const publications = Array.from(byKey.values());
+    const merged = Array.from(byKey.values());
 
-    // 4) Quick metrics (OpenAlex doesn’t give hIndex directly here)
+    // 4) Metrics (quick)
     const metrics = {
-      totalPublications: publications.length,
+      totalPublications: merged.length,
       totalCitations: null,
       hIndex: null,
       lastUpdated: new Date().toISOString().slice(0,10)
@@ -335,12 +313,20 @@ app.post('/api/authorPublications', async (req, res) => {
         name,
         college: affiliation || 'Unknown',
         department: department || 'Unknown',
-        externalIds: author?.id ? { openAlex: author.id, ...(orcid ? { orcid } : {}) } : (orcid ? { orcid } : {}),
-        publications,
+        externalIds: author?.id
+          ? { openAlex: author.id, ...(orcid ? { orcid } : {}) }
+          : (orcid ? { orcid } : {}),
+        publications: merged,
         metrics
       });
     } catch (e) {
       console.warn('[DB SAVE] failed (continuing):', e?.message || e);
+    }
+
+    // 6) Continuation token: if we still have a cursor and ran out of budget, return next
+    let nextToken = null;
+    if (cursor && timeLeftLocal() < 1200) {
+      nextToken = { oaCursor: cursor };
     }
 
     res.json({
@@ -352,16 +338,15 @@ app.post('/api/authorPublications', async (req, res) => {
         orcid: orcid || null,
         institution: author?.last_known_institution?.display_name || null
       },
-      publications,
+      publications: merged,
       metrics,
-      elapsedMs: Date.now() - started
+      next: nextToken
     });
   } catch (err) {
     console.error('AUTHOR_PUBLICATIONS_OA_ERROR', err);
-    res.json({ ok: true, source: 'openalex', author: null, publications: [], metrics: null, elapsedMs: Date.now() - started });
+    res.json({ ok: true, source: 'openalex', author: null, publications: [], metrics: null, next: null });
   }
 });
-
 
 /* =======================================================================================
    E) DB-first endpoints (unchanged)

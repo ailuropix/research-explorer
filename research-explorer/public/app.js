@@ -25,8 +25,8 @@ const kpiTotalPubsEl = document.getElementById('kpiTotalPubs');
 const kpiUpdatedEl = document.getElementById('kpiUpdated');
 
 // --- helpers ---
-function renderLoading() {
-  resultsList.innerHTML = '<div class="card"><div>Loading results…</div></div>';
+function renderLoading(msg = 'Loading results…') {
+  resultsList.innerHTML = `<div class="card"><div>${msg}</div></div>`;
   summaryContent.textContent = 'Generating summary…';
 }
 
@@ -179,35 +179,73 @@ function applyFiltersSort() {
   }
 }
 
-// --- MAIN SEARCH PIPELINE (single, final version) ---
+// ============== NEW: auto-loop fetch for ALL publications (OpenAlex) ==============
+async function fetchAllPublications({ name, affiliation = '', department = '' }) {
+  const all = [];
+  let next = null;
+  let loops = 0;
+  const MAX_LOOPS = 25; // safety valve: up to ~5000 works (25 * 200)
+
+  do {
+    const payload = next ? { name, affiliation, department, next } : { name, affiliation, department };
+    const data = await fetchJSON('/api/authorPublications', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+
+    const pubs = Array.isArray(data?.publications) ? data.publications : [];
+    all.push(...pubs);
+
+    // update KPI/progress in UI
+    if (kpiTotalPubsEl) kpiTotalPubsEl.textContent = String(all.length);
+    if (resultsMetaEl) {
+      resultsMetaEl.innerHTML = `<span class="results-count">${all.length} publications fetched…</span>`;
+    }
+    // slight visual feedback
+    renderResults(all.map(pub => ({
+      title: pub.title,
+      snippet: [pub.venue || '', pub.year || ''].filter(Boolean).join(' • '),
+      link: pub.url || '',
+      source: pub.url ? (new URL(pub.url).hostname) : 'publication',
+      year: pub.year || null,
+      venue: pub.venue || '',
+      type: (pub.type || 'other').toLowerCase(),
+      authors: Array.isArray(pub.authors) ? pub.authors : [],
+      doi: pub.doi || ''
+    })));
+
+    next = data?.next || null;
+    loops += 1;
+  } while (next && loops < MAX_LOOPS);
+
+  return all;
+}
+
+// --- MAIN SEARCH PIPELINE (final) ---
 async function searchAndSummarize(query, opts = {}) {
   try {
-    renderLoading();
+    renderLoading('Loading publications & web results…');
     if (opts?.name && sortSelectEl) sortSelectEl.value = 'yearDesc';
 
-    // web search + summary
+    // 1) fast web search (kept tiny to avoid timeouts)
     const webPromise = fetchJSON('/api/query', {
       method: 'POST',
       body: JSON.stringify({ query })
-    });
+    }).catch(() => ({ items: [], summary: '' }));
 
-    // publications by author
+    // 2) publications (auto-loop through continuation tokens)
     const maybeName = opts.name || facultyInput.value?.trim();
-    const pubsPromise = maybeName
-      ? fetchJSON('/api/authorPublications', {
-          method: 'POST',
-          body: JSON.stringify({
-            name: maybeName,
-            affiliation: opts.affiliation || '',
-            department: opts.department || ''
-          })
-        })
-      : null;
+    let allPubs = [];
+    if (maybeName) {
+      allPubs = await fetchAllPublications({
+        name: maybeName,
+        affiliation: opts.affiliation || '',
+        department: opts.department || ''
+      });
+    }
 
-    const data = await webPromise;
-    if (!data) throw new Error('Empty response from /api/query');
-
-    const baseItems = (Array.isArray(data.items) ? data.items : []).map(it => ({
+    const webData = (await webPromise) || { items: [], summary: '' };
+    const baseItems = (Array.isArray(webData.items) ? webData.items : []).map(it => ({
       title: it.title,
       snippet: it.snippet,
       link: it.link,
@@ -217,53 +255,33 @@ async function searchAndSummarize(query, opts = {}) {
       type: 'web'
     }));
 
-    let pubItems = [];
-    if (pubsPromise) {
-      try {
-        const pjson = await pubsPromise;
-        if (Array.isArray(pjson.publications)) {
-          pubItems = pjson.publications.map(pub => ({
-            title: pub.title,
-            snippet: [pub.venue || '', pub.year || ''].filter(Boolean).join(' • '),
-            link: pub.url || '',
-            source: pub.url ? new URL(pub.url).hostname : 'publication',
-            year: pub.year || null,
-            venue: pub.venue || '',
-            type: (pub.type || 'other').toLowerCase(),
-            authors: Array.isArray(pub.authors) ? pub.authors : [],
-            doi: pub.doi || ''
-          }));
-          if (pjson.metrics) {
-            if (kpiTotalPubsEl) kpiTotalPubsEl.textContent = String(pjson.metrics.totalPublications ?? pubItems.length);
-            if (kpiUpdatedEl) {
-              const d = pjson.metrics.lastUpdated ? new Date(pjson.metrics.lastUpdated) : null;
-              kpiUpdatedEl.textContent = d && !isNaN(d) ? d.toLocaleDateString() : '—';
-            }
-          } else {
-            if (kpiTotalPubsEl) kpiTotalPubsEl.textContent = String(pubItems.length);
-            if (kpiUpdatedEl) kpiUpdatedEl.textContent = '—';
-          }
-        }
-      } catch (e) {
-        console.warn('Publications fetch failed', e);
-      }
-    }
+    const pubItems = allPubs.map(pub => ({
+      title: pub.title,
+      snippet: [pub.venue || '', pub.year || ''].filter(Boolean).join(' • '),
+      link: pub.url || '',
+      source: pub.url ? new URL(pub.url).hostname : 'publication',
+      year: pub.year || null,
+      venue: pub.venue || '',
+      type: (pub.type || 'other').toLowerCase(),
+      authors: Array.isArray(pub.authors) ? pub.authors : [],
+      doi: pub.doi || ''
+    }));
 
     const merged = [...baseItems, ...pubItems];
     const seen = new Set();
     __allItems = merged.filter(it => {
-      const k = it.link || '';
-      if (!k) return true;
+      const k = it.link || `${it.title}::${it.year}::${it.venue}`;
       if (seen.has(k)) return false;
       seen.add(k);
       return true;
     });
-    __totalPublications = __allItems.filter(x => (x.type || 'web') !== 'web').length;
+    __totalPublications = pubItems.length;
     if (kpiTotalPubsEl) kpiTotalPubsEl.textContent = String(__totalPublications);
+    if (kpiUpdatedEl) kpiUpdatedEl.textContent = new Date().toLocaleDateString();
 
     applyFiltersSort();
 
-    summaryContent.textContent = data.summary || 'No summary available.';
+    summaryContent.textContent = webData.summary || 'No summary available.';
     summarySection.style.display = 'block';
   } catch (err) {
     console.error(err);
@@ -305,3 +323,6 @@ toggleSummary.addEventListener('click', () => {
   toggleSummary.textContent = hidden ? 'Hide' : 'Show';
   toggleSummary.setAttribute('aria-expanded', String(hidden));
 });
+
+// Optional: live re-apply filters when clicking "Apply Filters"
+if (applyFiltersBtn) applyFiltersBtn.addEventListener('click', applyFiltersSort);

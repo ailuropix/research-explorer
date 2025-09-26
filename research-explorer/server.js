@@ -192,26 +192,46 @@ app.post('/api/query', async (req, res) => {
    Response:
      { ok, source:"openalex", author, publications:[...], metrics, next? }
 ======================================================================================= */
+// ===== /api/authorPublications — OpenAlex-only (faster budget + soft cap) =====
 app.post('/api/authorPublications', async (req, res) => {
   const started = Date.now();
-  const BUDGET_MS = 9000;        // stay under Vercel 10s
-  const WORKS_PAGE = 200;        // OpenAlex with cursor supports up to 200 per page
+  const BUDGET_MS = 6500;   // tighter: stay well under Vercel's 10s
+  const WORKS_PAGE = 100;   // smaller page => quicker response
+  const DEFAULT_LIMIT = 300; // soft cap on pubs per invocation
 
-  const timeLeftLocal = () => timeLeft(started, BUDGET_MS);
-  const fetchTO = (url, opts, ms) => fetchWithTimeout(url, opts, Math.min(ms, timeLeftLocal()));
+  const timeLeft = () => Math.max(0, BUDGET_MS - (Date.now() - started));
+  const fetchWithTimeout = (url, opts = {}, ms = 4000) => {
+    const ctrl = new AbortController();
+    const id = setTimeout(() => ctrl.abort(), Math.min(ms, timeLeft()));
+    return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(id));
+  };
+  const namesSimilar = (a = '', b = '') => {
+    const A = a.toLowerCase().trim().replace(/\s+/g, ' ');
+    const B = b.toLowerCase().trim().replace(/\s+/g, ' ');
+    if (!A || !B) return false;
+    if (A === B || A.includes(B) || B.includes(A)) return true;
+    const ap = A.split(/\s+/), bp = B.split(/\s+/);
+    const aLast = ap[ap.length-1], bLast = bp[bp.length-1];
+    if (aLast !== bLast) return false;
+    const aFirst = ap[0], bFirst = bp[0];
+    if (aFirst === bFirst) return true;
+    if ((aFirst.length === 1 && bFirst.startsWith(aFirst)) || (bFirst.length === 1 && aFirst.startsWith(bFirst))) return true;
+    return false;
+  };
 
   try {
-    const { name, affiliation = '', department = '', next } = req.body || {};
+    const { name, affiliation = '', department = '', next, limit } = req.body || {};
     if (!name) return res.status(400).json({ error: 'Missing name' });
+    const MAX_PUBS = Math.max(50, Math.min(Number(limit) || DEFAULT_LIMIT, 1000)); // safety bounds
 
-    // 1) Find best author in OpenAlex
+    // 1) Find best author in OpenAlex (quick)
     let author = null;
     try {
       const aURL = new URL('https://api.openalex.org/authors');
       aURL.searchParams.set('search', name);
-      aURL.searchParams.set('per-page', '15');
+      aURL.searchParams.set('per-page', '12'); // smaller candidate set for speed
 
-      const aResp = await fetchTO(aURL.toString(), {}, 4000);
+      const aResp = await fetchWithTimeout(aURL.toString(), {}, 3000);
       if (aResp.ok) {
         const aJson = await aResp.json();
         const cands = Array.isArray(aJson?.results) ? aJson.results : [];
@@ -238,33 +258,34 @@ app.post('/api/authorPublications', async (req, res) => {
       return res.json({ ok: true, source: 'openalex', author: null, publications: [], metrics: null, next: null });
     }
 
-    // 2) Works with cursor pagination (resume via next.oaCursor if provided)
+    // 2) Works with cursor pagination (resume via next.oaCursor if provided) — stop early if we hit MAX_PUBS or budget
     const orcid = author?.orcid?.replace('https://orcid.org/', '') || '';
-    const publications = [];
+    const pubs = [];
     let cursor = (next && next.oaCursor) ? next.oaCursor : '*';
     let lastCursorUsed = cursor;
 
     try {
-      while (timeLeftLocal() > 1200 && cursor) {
+      while (timeLeft() > 1000 && cursor && pubs.length < MAX_PUBS) {
         const wURL = new URL('https://api.openalex.org/works');
         wURL.searchParams.set('per-page', String(WORKS_PAGE));
         wURL.searchParams.set('cursor', cursor);
         if (orcid) wURL.searchParams.set('filter', `author.orcid:${orcid}`);
         else       wURL.searchParams.set('filter', `author.display_name:${name}`);
 
-        const wResp = await fetchTO(wURL.toString(), {}, 3500);
+        const wResp = await fetchWithTimeout(wURL.toString(), {}, 3000);
         if (!wResp.ok) break;
 
         const wj = await wResp.json();
         const batch = Array.isArray(wj?.results) ? wj.results : [];
         for (const w of batch) {
+          if (pubs.length >= MAX_PUBS) break;
           const auths = w.authorships || [];
           const nameOk = orcid
             ? auths.some(a => a?.author?.orcid && a.author.orcid.endsWith(orcid))
             : auths.some(a => namesSimilar(a?.author?.display_name || '', name));
           if (!nameOk) continue;
 
-          publications.push({
+          pubs.push({
             title: w.title || '',
             year: w.publication_year || null,
             venue: w.host_venue?.display_name || '',
@@ -277,30 +298,29 @@ app.post('/api/authorPublications', async (req, res) => {
           });
         }
 
-        // next cursor (OpenAlex returns meta.next_cursor). If null -> done.
         lastCursorUsed = cursor;
         cursor = wj?.meta?.next_cursor || null;
 
-        // If page returned less than requested, likely the last one.
-        if (!cursor || (batch.length < WORKS_PAGE)) break;
+        if (!cursor || batch.length < WORKS_PAGE) break;           // natural end
+        if (pubs.length >= MAX_PUBS) break;                        // hit soft cap
       }
     } catch (e) {
       console.warn('[OA] works pagination failed:', e?.message || e);
     }
 
-    // 3) Dedupe: doi -> url -> title+year
+    // 3) Dedupe quickly: doi -> url -> title+year
     const byKey = new Map();
-    for (const p of publications) {
+    for (const p of pubs) {
       const k = (p.doi && `doi:${p.doi.toLowerCase()}`) ||
                 (p.url && `url:${p.url.toLowerCase()}`) ||
                 `ty:${(p.title || '').toLowerCase()}::${p.year || ''}`;
       if (!byKey.has(k)) byKey.set(k, p);
     }
-    const merged = Array.from(byKey.values());
+    const publications = Array.from(byKey.values());
 
-    // 4) Metrics (quick)
+    // 4) Quick metrics
     const metrics = {
-      totalPublications: merged.length,
+      totalPublications: publications.length,
       totalCitations: null,
       hIndex: null,
       lastUpdated: new Date().toISOString().slice(0,10)
@@ -316,16 +336,17 @@ app.post('/api/authorPublications', async (req, res) => {
         externalIds: author?.id
           ? { openAlex: author.id, ...(orcid ? { orcid } : {}) }
           : (orcid ? { orcid } : {}),
-        publications: merged,
+        publications,
         metrics
       });
     } catch (e) {
       console.warn('[DB SAVE] failed (continuing):', e?.message || e);
     }
 
-    // 6) Continuation token: if we still have a cursor and ran out of budget, return next
+    // 6) Continuation token: if more pages remain (cursor present) return it so UI can keep going
+    // Only return a next token if we either ran out of budget or hit MAX_PUBS
     let nextToken = null;
-    if (cursor && timeLeftLocal() < 1200) {
+    if (cursor && (timeLeft() < 900 || publications.length >= MAX_PUBS)) {
       nextToken = { oaCursor: cursor };
     }
 
@@ -338,7 +359,7 @@ app.post('/api/authorPublications', async (req, res) => {
         orcid: orcid || null,
         institution: author?.last_known_institution?.display_name || null
       },
-      publications: merged,
+      publications,
       metrics,
       next: nextToken
     });

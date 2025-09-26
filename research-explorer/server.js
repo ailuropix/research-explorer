@@ -201,71 +201,118 @@ app.post('/api/query', async (req, res) => {
    - Response shape: { ok, author, publications, metrics, next? }
 ======================================================================================= */
 // ===== FAST /api/authorPublications (replace your existing handler) =====
+// ===== /api/authorPublications — OpenAlex-only (fast, paged within time budget) =====
 app.post('/api/authorPublications', async (req, res) => {
-  const t0 = Date.now();
+  const started = Date.now();
+  const BUDGET_MS = 9000; // keep under Vercel 10s
+  const WORKS_PAGE = 200; // OpenAlex max per page when using cursor
+
+  // local helper (use the one you already have if defined globally)
+  function timeLeft() { return Math.max(0, BUDGET_MS - (Date.now() - started)); }
+  function fetchWithTimeout(url, opts = {}, ms = 5000) {
+    const ctrl = new AbortController();
+    const id = setTimeout(() => ctrl.abort(), ms);
+    return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(id));
+  }
+  const namesSimilar = (a = '', b = '') => {
+    const A = a.toLowerCase().trim().replace(/\s+/g, ' ');
+    const B = b.toLowerCase().trim().replace(/\s+/g, ' ');
+    if (!A || !B) return false;
+    if (A === B || A.includes(B) || B.includes(A)) return true;
+    const ap = A.split(/\s+/), bp = B.split(/\s+/);
+    const aLast = ap[ap.length-1], bLast = bp[bp.length-1];
+    if (aLast !== bLast) return false;
+    const aFirst = ap[0], bFirst = bp[0];
+    if (aFirst === bFirst) return true;
+    if ((aFirst.length === 1 && bFirst.startsWith(aFirst)) || (bFirst.length === 1 && aFirst.startsWith(bFirst))) return true;
+    return false;
+  };
+
   try {
     const { name, affiliation = '', department = '' } = req.body || {};
     if (!name) return res.status(400).json({ error: 'Missing name' });
 
-    // 1) Find best SS author (single quick call)
-    let best = null;
+    // 1) Find best-matching author in OpenAlex
+    let author = null;
     try {
-      const url = `https://api.semanticscholar.org/graph/v1/author/search?query=${encodeURIComponent(name)}&limit=10`;
-      const s = await fetch(url);
-      if (s.ok) {
-        const js = await s.json();
-        const cands = Array.isArray(js?.data) ? js.data : [];
-        const affL = affiliation.toLowerCase(), depL = department.toLowerCase();
-        best = cands
-          .map(c => {
-            const fields = [c.name || '', ...(c.aliases || []), ...(c.affiliations || [])].join(' ').toLowerCase();
-            let score = 0;
-            if ((c.name || '').toLowerCase() === name.toLowerCase()) score += 2;
-            if (affL && fields.includes(affL)) score += 2;
-            if (depL && fields.includes(depL)) score += 1;
-            return { c, score };
-          })
-          .sort((a,b) => b.score - a.score)[0]?.c || cands[0] || null;
+      const aURL = new URL('https://api.openalex.org/authors');
+      aURL.searchParams.set('search', name);
+      aURL.searchParams.set('per-page', '15');
+
+      const aResp = await fetchWithTimeout(aURL.toString(), {}, Math.min(4000, timeLeft()));
+      if (aResp.ok) {
+        const aJson = await aResp.json();
+        const cands = Array.isArray(aJson?.results) ? aJson.results : [];
+        const affL = affiliation.toLowerCase();
+        const depL = department.toLowerCase();
+
+        let best = null, bestScore = -1;
+        for (const c of cands) {
+          const nm = (c.display_name || '').toLowerCase();
+          const inst = (c.last_known_institution?.display_name || '').toLowerCase();
+          let s = 0;
+          if (nm === name.toLowerCase()) s += 2;
+          if (affL && inst.includes(affL)) s += 2;
+          if (depL && inst.includes(depL)) s += 1;
+          if (s > bestScore) { bestScore = s; best = c; }
+        }
+        author = best || cands[0] || null;
       }
     } catch (e) {
-      console.warn('[APUB] SS author lookup failed:', e?.message || e);
+      console.warn('[OA] author search failed:', e?.message || e);
     }
 
-    // 2) First page of SS papers (limit=100), filter by author name
-    const pubs = [];
-    if (best?.authorId) {
-      const fields = 'title,year,venue,url,authors,externalIds,publicationTypes,abstract';
-      const url = `https://api.semanticscholar.org/graph/v1/author/${best.authorId}/papers?limit=100&offset=0&fields=${encodeURIComponent(fields)}`;
-      try {
-        const r = await fetch(url);
-        if (r.ok) {
-          const j = await r.json();
-          const data = Array.isArray(j?.data) ? j.data : [];
-          for (const p of data) {
-            const authors = Array.isArray(p.authors) ? p.authors : [];
-            const hasName = authors.some(a => a?.name && a.name.toLowerCase().includes(name.toLowerCase()));
-            if (!hasName) continue;
-            pubs.push({
-              title: p.title || '',
-              year: p.year || null,
-              venue: p.venue || '',
-              url: p.url || '',
-              doi: (p.doi || p?.externalIds?.DOI) || '',
-              authors: authors.map(a => a.name).filter(Boolean),
-              type: (Array.isArray(p.publicationTypes) && p.publicationTypes[0]) ? p.publicationTypes[0].toLowerCase() : 'other',
-              origin: 'SS',
-              abstract: p.abstract || ''
-            });
-          }
+    if (!author) {
+      return res.json({ ok: true, source: 'openalex', author: null, publications: [], metrics: null, elapsedMs: Date.now() - started });
+    }
+
+    // 2) Fetch works using cursor pagination within time budget
+    const orcid = author?.orcid?.replace('https://orcid.org/', '') || '';
+    const works = [];
+    try {
+      let cursor = '*';
+      while (timeLeft() > 1200 && cursor) {
+        const wURL = new URL('https://api.openalex.org/works');
+        wURL.searchParams.set('per-page', String(WORKS_PAGE));
+        wURL.searchParams.set('cursor', cursor);
+        if (orcid) wURL.searchParams.set('filter', `author.orcid:${orcid}`);
+        else wURL.searchParams.set('filter', `author.display_name:${name}`);
+
+        const wResp = await fetchWithTimeout(wURL.toString(), {}, Math.min(3500, timeLeft()));
+        if (!wResp.ok) break;
+        const wj = await wResp.json();
+        const batch = Array.isArray(wj?.results) ? wj.results : [];
+        for (const w of batch) {
+          const auths = w.authorships || [];
+          const nameOk = orcid
+            ? auths.some(a => a?.author?.orcid && a.author.orcid.endsWith(orcid))
+            : auths.some(a => namesSimilar(a?.author?.display_name || '', name));
+          if (!nameOk) continue;
+
+          works.push({
+            title: w.title || '',
+            year: w.publication_year || null,
+            venue: w.host_venue?.display_name || '',
+            url: w.primary_location?.landing_page_url || (w.doi ? `https://doi.org/${w.doi}` : ''),
+            doi: w.doi || '',
+            authors: auths.map(a => a.author?.display_name).filter(Boolean),
+            type: (w.type || 'other').toLowerCase(),
+            origin: 'OA',
+            abstract: ''
+          });
         }
-      } catch (e) {
-        console.warn('[APUB] SS papers failed:', e?.message || e);
+
+        // next cursor (OpenAlex gives meta.next_cursor); stop if none or small page
+        cursor = wj?.meta?.next_cursor || null;
+        if (!cursor) break;
       }
+    } catch (e) {
+      console.warn('[OA] works pagination failed:', e?.message || e);
     }
 
-    // 3) Dedupe (doi -> url -> title+year)
+    // 3) Dedupe: doi -> url -> title+year
     const byKey = new Map();
-    for (const p of pubs) {
+    for (const p of works) {
       const k = (p.doi && `doi:${p.doi.toLowerCase()}`) ||
                 (p.url && `url:${p.url.toLowerCase()}`) ||
                 `ty:${(p.title || '').toLowerCase()}::${p.year || ''}`;
@@ -273,7 +320,7 @@ app.post('/api/authorPublications', async (req, res) => {
     }
     const publications = Array.from(byKey.values());
 
-    // 4) Quick metrics
+    // 4) Quick metrics (OpenAlex doesn’t give hIndex directly here)
     const metrics = {
       totalPublications: publications.length,
       totalCitations: null,
@@ -281,14 +328,14 @@ app.post('/api/authorPublications', async (req, res) => {
       lastUpdated: new Date().toISOString().slice(0,10)
     };
 
-    // 5) ALWAYS save to DB (idempotent upserts handled in persist.js)
+    // 5) ALWAYS save to DB
     try {
       const { saveFacultyAndPublications } = await import('./src/services/persist.js');
       await saveFacultyAndPublications({
         name,
         college: affiliation || 'Unknown',
         department: department || 'Unknown',
-        externalIds: best?.authorId ? { semanticScholar: best.authorId } : {},
+        externalIds: author?.id ? { openAlex: author.id, ...(orcid ? { orcid } : {}) } : (orcid ? { orcid } : {}),
         publications,
         metrics
       });
@@ -298,17 +345,23 @@ app.post('/api/authorPublications', async (req, res) => {
 
     res.json({
       ok: true,
-      author: best ? { id: best.authorId, name: best.name || name } : null,
+      source: 'openalex',
+      author: {
+        id: author?.id || null,
+        name: author?.display_name || name,
+        orcid: orcid || null,
+        institution: author?.last_known_institution?.display_name || null
+      },
       publications,
       metrics,
-      elapsedMs: Date.now() - t0
+      elapsedMs: Date.now() - started
     });
   } catch (err) {
-    console.error('AUTHOR_PUBLICATIONS_ERROR', err);
-    // Always return JSON so the frontend doesn’t see text/plain and crash
-    res.json({ ok: true, author: null, publications: [], metrics: null, elapsedMs: Date.now() - t0 });
+    console.error('AUTHOR_PUBLICATIONS_OA_ERROR', err);
+    res.json({ ok: true, source: 'openalex', author: null, publications: [], metrics: null, elapsedMs: Date.now() - started });
   }
 });
+
 
 /* =======================================================================================
    E) DB-first endpoints (unchanged)

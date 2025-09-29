@@ -31,10 +31,10 @@ npm run db:up
 ```
 
 This will start a PostgreSQL 16 container with:
-- User: `fra_admin`
-- Password: `fra_pass`
-- Database: `fra_db`
-- Port: `5432`
+- User: ``
+- Password: ``
+- Database: ``
+- Port: ``
 
 ### 2. Create .env file
 
@@ -48,7 +48,7 @@ Edit `.env` to include:
 ```
 SERPER_API_KEY=your_serper_api_key
 GOOGLE_API_KEY=your_google_ai_key
-DATABASE_URL=postgresql://fra_admin:fra_pass@localhost:5432/fra_db?schema=public
+DATABASE_URL=
 ```
 
 ### 3. Run Database Migration

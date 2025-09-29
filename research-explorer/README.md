@@ -125,7 +125,7 @@ The application uses three main models:
 1. Start the database: `npm run db:up`
 2. Run migrations: `npm run db:migrate`
 3. Start the server: `npm run dev`
-4. Search for a faculty member (e.g., "Niki Modi" from "Thakur College of Engineering and Technology")
+4. Search for a faculty member 
 5. The data will be automatically saved to the database
 6. Use the admin APIs to retrieve stored data:
 
